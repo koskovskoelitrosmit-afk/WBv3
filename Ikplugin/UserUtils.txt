@@ -1,0 +1,50 @@
+local module = {}
+
+local Rig_Insertion_SavedUsers = shared._IKRigGlobal.GetSetting("SavedUsers_RIG_INSERTION") or {}
+
+local function ValidateUserId(UserId: number)
+	if typeof(UserId) ~= "number" then
+		return false
+	end
+	return true
+end
+
+function module.GetUserData(UserId: number)
+	if not ValidateUserId(UserId) then return end
+	return {
+		Username = module.GetUsername(UserId),
+		Picture = module.GetUserThumbnail(UserId),
+		Id = UserId
+	}
+end
+
+function module.GetUserThumbnail(UserId: number)
+	if not ValidateUserId(UserId) then return end
+	return game:GetService("Players")
+		:GetUserThumbnailAsync(UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+end
+
+function module.GetUsername(UserId: number)
+	if not ValidateUserId(UserId) then return end
+	return game:GetService("Players"):GetNameFromUserIdAsync(UserId)
+end
+
+function module.GetRigInsertionSavedUsers()
+	return Rig_Insertion_SavedUsers
+end
+
+function module.SaveRigInsertionUser(UserId: string)
+	if not ValidateUserId(tonumber(UserId)) then return end
+	if table.find(Rig_Insertion_SavedUsers, UserId) then return end
+	table.insert(Rig_Insertion_SavedUsers, UserId)
+end
+
+function module.RemoveRigInsertionUser(UserId: string)
+	if not ValidateUserId(tonumber(UserId)) then return end
+	local i = table.find(Rig_Insertion_SavedUsers, UserId)
+	if i then
+		table.remove(Rig_Insertion_SavedUsers, i)
+	end
+end
+
+return module

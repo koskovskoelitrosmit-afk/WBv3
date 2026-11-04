@@ -1,0 +1,389 @@
+const Tween = require(script.Parent:WaitForChild("Tween"))
+const SIGNAL = require(script.Parent:WaitForChild("Signal"))
+
+type btnModifier = {
+	Size: number,
+	Brightness: number,
+	Transparency: number,
+}
+type btnConfig = {
+	HoverModifiers: btnModifier,
+	DownModifiers: btnModifier
+}
+
+
+const DEFUALT_CONFIG: btnConfig = {
+	HoverModifiers = {
+		Size = 1,
+		Brightness = 1
+	},
+	DownModifiers = {
+		Size = 1,
+		Brightness = 1
+	}
+}
+
+local function Brighten(color: Color3, amount: number)
+	return Color3.new(
+		math.clamp(color.R * amount, 0, 1),
+		math.clamp(color.G * amount, 0, 1),
+		math.clamp(color.B * amount, 0, 1)
+	)
+end
+
+const module = {}
+module.__index = module
+
+function module.new(btn: GuiButton, config: btnConfig)
+	local self = setmetatable({}, module)
+	
+	self._enabled = true
+	
+	self.Properties = {
+		Size = btn.Size,
+		AbsoluteSize = btn.AbsoluteSize,
+		BgTransparency = math.clamp(btn.BackgroundTransparency, 0, 1),
+		BgColor = btn.BackgroundColor3,
+		ContentTransparency = math.clamp(
+			btn:IsA("TextButton") and btn.TextTransparency or (btn:IsA("ImageButton") and btn.ImageTransparency or 1),
+			0, 1)
+	}
+	
+	self.OriginalProperties = table.clone(self.Properties)
+	
+	self.Button = btn
+	self.State = {
+		Hover = false,
+		Down = false
+	}
+	
+	self.CurrentModifiers = {
+		Size = 1,
+		Brightness = 1
+	}
+	
+	
+	self.Modifiers = {
+		Hover = config and config.HoverModifiers or DEFUALT_CONFIG.HoverModifiers,
+		Down = config and config.DownModifiers or DEFUALT_CONFIG.DownModifiers
+	}
+	
+	self._tweens = {}
+	self._renderConnection = nil
+	
+	self.Click = SIGNAL.new()
+	
+	self:init()
+	return self
+end
+
+function module:init()
+	self.Button.MouseEnter:Connect(function()
+		self.State.Hover = true
+		self:_applyStateModifiers("Hover")
+	end)
+	self.Button.MouseLeave:Connect(function()
+		self.State.Hover = false
+		self.State.Down = false
+		self:_resetStateModifiers("Hover")
+		self:_resetStateModifiers("Down")
+	end)
+	self.Button.MouseButton1Down:Connect(function()
+		self.State.Down = true
+		self:_applyStateModifiers("Down")
+	end)
+	self.Button.MouseButton1Up:Connect(function()
+		if not self.State.Down then return end
+		self.State.Down = false
+		if self.State.Hover then
+			self:_applyStateModifiers("Hover")
+		else
+			self:_resetStateModifiers("Down")
+		end
+	end)
+	
+	self.Button.Destroying:Once(function()
+		if getmetatable(self) == module then
+			self:Destroy()
+		end
+	end)
+	
+	self.Button.MouseButton1Click:Connect(function(...)
+		if not self._enabled then return end
+		self.Click:Fire(...)
+	end)
+	
+	self:_render()
+end
+
+function module:SetEnabled(enabled: boolean)
+	self._enabled = enabled
+end
+
+function module:IsEnabled()
+	return self._enabled
+end
+
+function module:SetProperty(property: string, value: any)
+	self.Properties[property] = value
+	self:_render()
+end
+
+function module:GetProperty(property: string)
+	return self.Properties[property]
+end
+
+function module:Tween(properties: {[string]: any}, twnDetails: Tween.TweenDetails)
+	-- creates a tween object for each button property given in the properties table
+	-- returns an object with methods to control the created tweens
+	
+	--[[
+	example usage:
+	    local obj = btn:Tween({BgColor = someColor, Size = someSize})
+	    obj.Play() -- plays all tweens
+	    obj.Cancel() -- cancels all tweens
+	    obj.Destroy() -- destroys all the tweens
+	    obj.Get() -- returns the tweens
+	    
+	    if a property name is passed, it will only do the action to tween of that property
+	    example:
+	        obj.Play("BgColor") -- only plays the tween for the bg color
+	]]
+	
+	local createdTweens = {}
+	for name, val in properties do
+		if self.Properties[name] == nil then continue end
+		
+		local twn = Tween.new(self.Properties[name], val, {
+			Time = twnDetails and twnDetails.Time or 0.1,
+			Style = twnDetails and twnDetails.Style or "Sine",
+			Direction = twnDetails and twnDetails.Direction or "Out",
+			Reverse = twnDetails and twnDetails.Reverse or false
+		})
+		
+		twn.Tick:Connect(function(newVal)
+			self.Properties[name] = newVal
+			self:_render()
+		end)
+		
+		createdTweens[name] = twn
+	end
+	
+	return {
+		Play = function(s: string?)
+			if s then
+				local tween = createdTweens[s]
+				self:_playTween(tween, s)
+				return
+			end
+			
+			for name, tween in createdTweens do
+				self:_playTween(tween, name)
+			end
+		end,
+		
+		Cancel = function(s: string?)
+			if s then
+				local tween = createdTweens[s]
+				if tween then tween:Cancel(); createdTweens[s] = nil end
+			else
+				for _, tween in createdTweens do
+					tween:Cancel()
+				end
+				createdTweens = {}
+			end
+		end,
+		
+		Destroy = function(s: string?)
+			if s then
+				local tween = createdTweens[s]
+				if tween then tween:Destroy(); createdTweens[s] = nil end
+			else
+				for _, tween in createdTweens do
+					tween:Destroy()
+				end
+				createdTweens = {}
+			end
+		end,
+		
+		Get = function(s: string?)
+			if s then
+				return createdTweens[s]
+			end
+			return createdTweens
+		end
+	}
+end
+
+
+function module:SetContent(content: string, twnDetails: Tween.TweenDetails)
+	-- sets the content of the button, text or image based on the button type
+	-- if twnDetails is provided, it will tween the change otherwise it will change it instantly and return
+	
+	local contentProperty = self.Button:IsA("TextButton") and "Text" or "Image"
+	
+	-- 
+	if not twnDetails then
+		twnDetails = {Time = 0}
+	end
+	
+	local fadeIn = self:Tween({ContentTransparency = 1}, twnDetails)
+	local fadeOut = self:Tween({ContentTransparency = self.OriginalProperties.ContentTransparency}, twnDetails)
+	
+	fadeIn.Get("ContentTransparency").Completed:Once(function(interrupt)
+		self.Button[contentProperty] = content
+		if not interrupt then
+			fadeOut.Play()
+		end
+	end)
+	
+	fadeIn.Play()
+end
+
+
+function module:GetContent()
+	-- returns the content of the button, text or image based on the button type
+	
+	if self.Button:IsA("TextButton") then
+		return "Text", self.Button.Text
+	elseif self.Button:IsA("ImageButton") then
+		return "Image", self.Button.Image
+	end
+end
+
+
+
+----/// PRIVATE
+
+function module:_render()
+	-- applies the current data and modifiers to the button
+	
+	
+	-- size, adds offset UDim2Size to the current size
+	local sizeAddition = self.Properties.AbsoluteSize * (self.CurrentModifiers.Size - 1)
+	self.Button.Size = self.Properties.Size + UDim2.fromOffset(sizeAddition.X, sizeAddition.Y)
+	
+	-- background color & transparency
+	self.Button.BackgroundColor3 = Brighten(self.Properties.BgColor, self.CurrentModifiers.Brightness)
+	self.Button.BackgroundTransparency = self.Properties.BgTransparency
+	
+	-- content transparency
+	if self.Button:IsA("TextButton") then
+		self.Button.TextTransparency = self.Properties.ContentTransparency
+	elseif self.Button:IsA("ImageButton") then
+		self.Button.ImageTransparency = self.Properties.ContentTransparency
+	end
+end
+
+function module:_connectRender()
+	-- starts rendering the button
+	
+	if self._renderConnection then
+		return
+	end
+	
+	self._renderConnection = game.RunService.Heartbeat:Connect(function()
+		if not self:_hasActiveTweens() then
+			self:_disconnectRender()
+			return
+		end
+		
+		self:_render()
+	end)
+end
+
+function module:_disconnectRender()
+	-- stops rendering the button
+	if self._renderConnection then
+		self._renderConnection:Disconnect()
+		self._renderConnection = nil
+	end
+end
+
+function module:_playTween(tween, id: string)
+	-- plays tweens safely, handles tween conflicts and removes completed tweens
+	
+	if not tween then return end
+	if self._tweens[id] == tween then return end
+
+	if self._tweens[id] then
+		self._tweens[id]:Destroy()
+	end
+	
+	tween.Completed:Once(function()
+		if self._tweens[id] == tween then
+			self._tweens[id] = nil
+		end
+	end)
+	
+	self._tweens[id] = tween
+	
+	self:_connectRender()
+	
+	tween:Play()
+end
+
+function module:_applyStateModifiers(state: string)
+	local modifiers = self.Modifiers[state]
+	if not modifiers then return end
+	
+	--[[
+	applies state modifiers
+	example:
+		- :_applyStateModifiers("hover"), this will tween the button's modifiers to the hover state
+	]]
+	for modifier, value in modifiers do
+		
+		-- tween instead of immediately set the modifier for smoothness
+		local tween = Tween.new(self.CurrentModifiers[modifier], value, {Time = 0.12, Style = "Sine"})
+		tween.Tick:Connect(function(val)
+			self.CurrentModifiers[modifier] = val
+		end)
+		
+		--- using this instead of tween:Play() because :_playTween handles tween conflicts and connections
+		self:_playTween(tween, modifier)
+	end
+	
+end
+
+function module:_resetStateModifiers(state: string)
+	-- this is the same as :_applyStateModifiers(), but tweens the modifiers back to the default state
+	
+	local modifiers = self.Modifiers[state]
+	if not modifiers then return end
+
+	for modifier in modifiers do
+		local tween = Tween.new(self.CurrentModifiers[modifier], 1, {Time = 0.12, Style = "Sine"})
+		tween.Tick:Connect(function(val)
+			self.CurrentModifiers[modifier] = val
+		end)
+
+		self:_playTween(tween, modifier)
+	end
+end
+
+
+function module:_hasActiveTweens()
+	return next(self._tweens) ~= nil
+end
+
+----/// PRIVATE END
+
+
+function module:Destroy()
+	-- clears all connections and tweens, destroys the button
+	self:_disconnectRender()
+	
+	for _, t in self._tweens do
+		t:Destroy()
+	end
+	
+	if self.Button and self.Button.Parent then
+		self.Button:Destroy()
+	end
+	
+	setmetatable(self, nil)
+	for k in self do self[k] = nil end
+end
+
+return module

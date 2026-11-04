@@ -1,0 +1,92 @@
+
+
+local module = {}
+module.__index = module
+
+function module.new(ui: GuiObject)
+	local self = setmetatable({}, module)
+	
+	local dragBtn = Instance.new("TextButton")
+	dragBtn.BackgroundTransparency = 1
+	dragBtn.Size = UDim2.new(1, 0, 1, 0)
+	dragBtn.Text = ""
+	dragBtn.Name = "__DragBtn"
+	dragBtn.Parent = ui
+	
+	self.ui = ui
+	self._dragBtn = dragBtn
+	self._dragging = false
+	self._connections = require(script.Parent.Parent.CleanUp).new()
+	
+	local signal = require(script.Parent.Parent.Signal)
+	self.Dragged = signal.new()
+	self.DragStarted = signal.new()
+	self.DragEnded = signal.new()
+	
+	self._lastPos = nil
+	
+	self:init()
+	return self
+end
+
+function module:init()
+	local dragBtn = self._dragBtn
+	local cn = self._connections
+	
+	cn:Connect(dragBtn.InputBegan, function(inputObject: InputObject)
+		if inputObject.UserInputType == Enum.UserInputType.MouseButton1 then
+			self:BeginDrag(Vector2.new(inputObject.Position.X, inputObject.Position.Y))
+		end
+	end)
+	
+	cn:Connect(dragBtn.InputEnded, function(inputObject: InputObject)
+		if inputObject.UserInputType == Enum.UserInputType.MouseButton1 then
+			self:EndDrag()
+		end
+	end)
+	
+	cn:Connect(game:GetService("UserInputService").InputChanged, function(inputObject: InputObject)
+		if not self._lastPos then return end
+		if inputObject.UserInputType == Enum.UserInputType.MouseMovement then
+			local lastPos = self._lastPos
+			local currentPos = Vector2.new(inputObject.Position.X, inputObject.Position.Y)
+			self._lastPos = currentPos
+			self:FireDrag(currentPos - lastPos)
+		end
+	end)
+	
+	dragBtn.Destroying:Once(function()
+		self:Destroy()
+	end)
+end
+
+
+function module:BeginDrag(pos)
+	if self._dragging then return end
+	self._dragging = true
+	self._lastPos = pos
+	self.DragStarted:Fire(pos)
+end
+
+function module:EndDrag()
+	if not self._dragging then return end
+	self._dragging = false
+	self.DragEnded:Fire()
+end
+
+function module:FireDrag(delta: Vector2)
+	if not self._dragging then return end
+	self.Dragged:Fire(delta)
+end
+
+function module:Destroy()
+	self._connections:CleanUp()
+	
+	if self.ui and self.ui.Parent then
+		self.ui:Destroy() self.ui = nil
+	end
+	
+	setmetatable(self, nil)
+end
+
+return module

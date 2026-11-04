@@ -1,0 +1,267 @@
+
+
+local global = shared._IKRigGlobal
+local toolbar = global.toolbar
+local guiUtil = global.utils.Gui
+local RigUtils = global.utils.Rig
+local IkCalc = global.utils.IkCalc
+local Selection = global.utils.Selection
+
+local state = global.state
+
+local collectionService = game:GetService("CollectionService")
+local IKRig_Tag = global.IKRig_Tag
+
+local ToolController = global.classes.PluginToolController.new(toolbar, {
+	Name = "Toggle IK",
+	Description = "Turn Rig IK on/off for the selected rig(s).",
+	Icon = "rbxassetid://4483362458"
+})
+
+
+
+-----------------------------------------------------
+-- Utils
+
+local function IsRigActive(rig)
+	return table.find(state.activeRigs, rig) ~= nil
+end
+
+
+local GlobalStatusFrame = guiUtil.GetFrame("GlobalStatus")
+local LocalStatusFrame = guiUtil.GetFrame("LocalStatus")
+local function UpdateLocalStatus()
+	local selectedRigs = Selection.GetSelectedRigs().IK
+	local totalActive, totalRigs = 0, #selectedRigs
+	for _, rig in selectedRigs do
+		if IsRigActive(rig) then totalActive += 1 end
+	end
+
+	if #selectedRigs == 0 then
+		LocalStatusFrame.Visible = false
+		return
+	end
+	
+	if totalActive == 0 then
+		LocalStatusFrame.Label.Text = `Selected Rig(s) are Inactive`
+		LocalStatusFrame.Label.TextColor3 = Color3.fromRGB(255, 64, 64)
+	elseif totalActive == totalRigs then
+		LocalStatusFrame.Label.Text = `Selected Rig(s) are Active`
+		LocalStatusFrame.Label.TextColor3 = Color3.fromRGB(85, 187, 255)
+	else
+		LocalStatusFrame.Label.Text = ""
+	end
+
+	LocalStatusFrame.Visible = true
+end
+
+
+local function DeactivateRig(rig)
+	if not IsRigActive(rig) then return end
+	table.remove(state.activeRigs, table.find(state.activeRigs, rig))
+	if rig and rig.Parent then
+		RigUtils.ResetRigLegs(rig)
+	end
+	UpdateLocalStatus()
+end
+
+local function ActivateRig(rig)
+	if IsRigActive(rig) then return end
+	table.insert(state.activeRigs, rig)
+	UpdateLocalStatus()
+end
+
+-----------------------------------------------------
+--- IK Update Functions
+
+local Logger = global.classes.Logger
+
+local function IKRigUpdate_R6(Rig)
+	if not Rig or not Rig.Parent then
+		return
+	end
+
+	local LeftRoot = Rig:FindFirstChild("LeftLegRoot")
+	local LeftTarget = Rig:FindFirstChild("LeftLegTarget")
+	local LeftLeg = Rig:FindFirstChild("Left Leg")
+
+	local RightRoot = Rig:FindFirstChild("RightLegRoot")
+	local RightTarget = Rig:FindFirstChild("RightLegTarget")
+	local RightLeg = Rig:FindFirstChild("Right Leg")
+
+	local success, err = pcall(function()
+		if LeftRoot and LeftTarget and LeftLeg then
+			LeftLeg.CFrame = IkCalc.CalcR6(LeftRoot.CFrame, LeftTarget.CFrame * CFrame.new(0, -LeftTarget.Size.Y/2, 0), LeftLeg.Size.Y)
+		end
+
+		if RightRoot and RightTarget and RightLeg then
+			RightLeg.CFrame = IkCalc.CalcR6(RightRoot.CFrame, RightTarget.CFrame * CFrame.new(0, -RightTarget.Size.Y/2, 0), RightLeg.Size.Y)
+		end
+	end)
+
+	if not success then
+		Logger.Warn(`IK Update failed for Rig {Rig.Name}: {err}`)
+		DeactivateRig(Rig)
+	end
+end
+
+
+
+local function IKRigUpdate_R15(Rig)
+	if not Rig or not Rig.Parent then
+		return
+	end
+
+	local LeftRoot = Rig:FindFirstChild("LeftLegRoot")
+	local LeftTarget = Rig:FindFirstChild("LeftLegTarget")
+	local LeftHip = Rig:FindFirstChild("LeftUpperLeg")
+	local LeftLeg = Rig:FindFirstChild("LeftLowerLeg")
+	local LeftFoot = Rig:FindFirstChild("LeftFoot")
+
+	local RightRoot = Rig:FindFirstChild("RightLegRoot")
+	local RightTarget = Rig:FindFirstChild("RightLegTarget")
+	local RightHip = Rig:FindFirstChild("RightUpperLeg")
+	local RightLeg = Rig:FindFirstChild("RightLowerLeg")
+	local RightFoot = Rig:FindFirstChild("RightFoot")
+	
+	local lJoints, rJoints = RigUtils.GetIkJointsR15(Rig, true)
+	local RightLength, LeftLength = RigUtils.CalcLegLengthR15(Rig)
+	
+	local success, err = pcall(function()
+		if LeftRoot and LeftTarget and LeftHip and LeftLeg and LeftFoot then
+			local L1, L2 = LeftLength.L1, LeftLength.L2
+			LeftHip.CFrame, LeftLeg.CFrame, LeftFoot.CFrame = 
+				IkCalc.CalcR15(LeftRoot.CFrame, LeftTarget.CFrame * CFrame.new(0, -LeftTarget.Size.Y/2, 0), lJoints, L1, L2, LeftFoot.Size.Y)
+		end
+
+		if RightRoot and RightTarget and RightHip and RightLeg and RightFoot then
+			local L1, L2 = RightLength.L1, RightLength.L2
+			RightHip.CFrame, RightLeg.CFrame, RightFoot.CFrame = 
+				IkCalc.CalcR15(RightRoot.CFrame, RightTarget.CFrame * CFrame.new(0, -RightTarget.Size.Y/2, 0), rJoints, L1, L2, RightFoot.Size.Y)
+		end
+	end)
+
+	if not success then
+		DeactivateRig(Rig)
+		Logger.Warn(`Failed to solve IK for Rig {Rig.Name}: {err}`)
+	end
+end
+
+
+-----------------------------------------------------
+
+local function DisconnectIK()
+	if state.ikConnection then
+		state.ikConnection:Disconnect()
+		state.ikConnection = nil
+	end
+	state.ikActive = false
+	GlobalStatusFrame.Visible = false
+end
+
+
+local function ConnectIK()
+	state.ikActive = true
+	GlobalStatusFrame.Visible = true
+	
+	local connection = nil
+	state.ikConnection = game["Run Service"].Heartbeat:Connect(function()
+		if state == nil or global == nil then
+			if connection then
+				connection:Disconnect()
+				connection = nil
+			end
+			return
+		end
+		if #state.activeRigs == 0 or not state.ikActive then
+			for _, rig in state.activeRigs do
+				DeactivateRig(rig)
+			end
+			DisconnectIK()
+			return
+		end
+		
+		for _, rig in state.activeRigs do
+			if not rig or not rig.Parent then
+				DeactivateRig(rig)
+				continue
+			end
+			
+			local rigType = RigUtils.GetRigType(rig)
+			if rigType == "R15" then
+				IKRigUpdate_R15(rig)
+			elseif rigType == "R6" then
+				IKRigUpdate_R6(rig)
+			end
+		end
+	end)
+	connection = state.ikConnection
+end
+
+
+
+
+
+
+
+
+
+ToolController:BindToolButton(function()
+	local selectedRigs = Selection.GetSelectedRigs().IK
+	if #selectedRigs == 0 then return end
+	
+	local totalActive, totalRigs = 0, #selectedRigs
+	for _, rig in selectedRigs do
+		if IsRigActive(rig) then totalActive += 1 end
+	end
+	
+	-- if all selected are active, then deactivate all
+	-- else, activate all non active selected rigs
+	
+	if totalRigs == totalActive then
+		for _, rig in selectedRigs do
+			DeactivateRig(rig)
+		end
+		return
+	end
+	
+	for _, rig in selectedRigs do
+		ActivateRig(rig)
+	end
+	
+	if #state.activeRigs > 0 then
+		ConnectIK()
+	end
+end, false)
+
+
+
+
+ToolController:RegisterUpdater(Selection.SelectionChanged, UpdateLocalStatus)
+
+
+ToolController:RegisterEvent(collectionService:GetInstanceRemovedSignal(IKRig_Tag), function(rig)
+	DeactivateRig(rig)
+end)
+
+
+ToolController:RegisterEvent(guiUtil.GetButton("globalStatus").Click, function()
+	Selection.Set(state.activeRigs)
+end)
+
+
+ToolController:BindToUnload(function()
+	Logger = nil
+	GlobalStatusFrame = nil
+	LocalStatusFrame = nil
+	global = nil
+	toolbar = nil
+	guiUtil = nil
+	RigUtils = nil
+	IkCalc = nil
+	Selection = nil
+	state = nil
+	ToolController = nil
+end)
+
+return ToolController

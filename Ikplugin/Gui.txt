@@ -1,0 +1,105 @@
+const global = shared._IKRigGlobal
+const buttonClass = global.classes.Button
+const CheckboxClass = global.classes.Checkbox
+
+local currentGui = nil
+
+local buttons = {}
+local buttonsConfig = require(script:WaitForChild("ButtonsConfig"))
+
+local function init()
+	local gui = script:WaitForChild("IK-Rig Plugin GUI"):Clone()
+	local coreGui = game:GetService("CoreGui")
+	
+	if coreGui:FindFirstChild(gui.Name) then
+		coreGui[gui.Name]:Destroy()
+	end
+	
+	for _, btn in gui:GetDescendants() do
+		if btn:IsA("GuiButton") then
+			local btnConfig = buttonsConfig[btn.Name]
+			local btnObj = nil
+			if btnConfig and btnConfig._Type == "Checkbox" then
+				btnObj = CheckboxClass.new(btn, btnConfig)
+			else
+				btnObj = buttonClass.new(btn, btnConfig)
+			end
+			
+			buttons[btn.Name] = btnObj
+		end
+	end
+	
+	gui.Parent = coreGui
+	currentGui = gui
+end
+
+
+init()
+
+
+
+local module = {}
+
+function module.GetGui()
+	return currentGui
+end
+
+function module.ToggleGui(enabled: boolean?)
+	local gui = module.GetGui()
+	if enabled ~= nil then gui.Enabled = enabled else gui.Enabled = not gui.Enabled end
+	return gui.Enabled
+end
+
+function module.ToggleFrame(name: string, enabled: boolean?)
+	local frame = module.GetFrame(name)
+	if enabled ~= nil then frame.Visible = enabled else frame.Visible = not frame.Visible end
+	return frame.Visible
+end
+
+function module.GetFrame(name: string)
+	local gui = module.GetGui()
+	return gui:FindFirstChild(name) or gui:FindFirstChild("StateFrame"):FindFirstChild(name)
+end
+
+function module.GetButton(name: string)
+	return buttons[name]
+end
+
+function module.NewButton(btn: GuiButton, _type: ("Checkbox" | "Button") ?, btnConfig)
+	_type = _type or "Button"
+	local btnObj = nil
+	if _type == "Checkbox" then
+		btnObj = CheckboxClass.new(btn, btnConfig)
+	else
+		btnObj = buttonClass.new(btn, btnConfig)
+	end
+	
+	if buttons[btn.Name] then
+		buttons[btn.Name]:Destroy()
+	end
+	
+	buttons[btn.Name] = btnObj
+	return btnObj
+end
+
+function module.IsPointInGuiObject(obj: GuiObject, point: Vector2)
+	assert(obj, "no gui object given")
+	assert(point, "no point given")
+	
+	local pos = obj.AbsolutePosition
+	local size = obj.AbsoluteSize
+	
+	local validX = point.X >= pos.X and point.X <= pos.X + size.X
+	local validY = point.Y >= pos.Y and point.Y <= pos.Y + size.Y
+	
+	return validX and validY
+end
+
+function module.Destroy()
+	if currentGui then
+		currentGui:Destroy()
+	end
+	currentGui = nil
+end
+
+return module

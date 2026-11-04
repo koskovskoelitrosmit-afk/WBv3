@@ -1,0 +1,87 @@
+
+
+
+local module = {}
+
+function module.CalculateR15(model: Model)
+	local cf, size = model:GetBoundingBox()
+	local rootPart = model.HumanoidRootPart :: BasePart
+	local lTorso = model:FindFirstChild("LowerTorso") :: BasePart
+	local humanoid = model:FindFirstChildWhichIsA("Humanoid")
+	
+	local rigHeightScale = (humanoid:FindFirstChild("BodyHeightScale") and humanoid.BodyHeightScale.Value) 
+		or rootPart.Size.Y / 2 -- 2 is the height size of the default R15 root part
+	
+	local rootOffsetFromGround = (cf * CFrame.new(0,-size.Y/2,0)):ToObjectSpace(rootPart.CFrame).Y
+	
+	--local rootC0Attachment = rootPart:FindFirstChild("IK-RootC0") or {CFrame = CFrame.new(0, -rootPart.Size.Y/2, 0)}
+	local rootC1Attachment = rootPart:FindFirstChild("IK-RootC1") or {CFrame = CFrame.new(0, -lTorso.Size.Y/2, 0)}
+	local rightHipC0Attachment = model.LowerTorso:FindFirstChild("IK-RightHipC0") or {CFrame.new(lTorso.Size.X/4, -lTorso.Size.Y/2, 0)}
+	local leftHipC0Attachment = model.LowerTorso:FindFirstChild("IK-LeftHipC0") or {CFrame = CFrame.new(-lTorso.Size.X/4, -lTorso.Size.Y/2, 0)}
+	
+	
+	return {
+		HeightScale = rigHeightScale,
+		RootController = {
+			C0 = CFrame.new(), C1 = CFrame.new(0, rootOffsetFromGround - 0.025, 0)
+		},
+		Root = {
+			C0 = CFrame.new(0, rootOffsetFromGround - rigHeightScale - 0.025, 0),
+			C1 = rootC1Attachment.CFrame
+		},
+		RightLegRoot = {
+			C0 = rightHipC0Attachment.CFrame, C1 = CFrame.new()
+		},
+		LeftLegRoot = {
+			C0 = leftHipC0Attachment.CFrame, C1 = CFrame.new()
+		},
+		RightLegTarget = {
+			C0 = CFrame.new(rightHipC0Attachment.CFrame.Position.X, 0.175 * rigHeightScale - 0.025, 0), C1 = CFrame.new()
+		},
+		LeftLegTarget = {
+			C0 = CFrame.new(leftHipC0Attachment.CFrame.Position.X, 0.175 * rigHeightScale - 0.025, 0), C1 = CFrame.new()
+		},
+	}
+end
+
+function module.CalculateR6(model: Model)
+	local cf, size = model:GetBoundingBox()
+	local rootPart = model.HumanoidRootPart :: BasePart
+	local torso = model.Torso :: BasePart
+	local leftLeg = model["Left Leg"] :: BasePart
+	local rightLeg = model["Right Leg"] :: BasePart
+	
+	
+	local rootOffsetFromGround = (cf * CFrame.new(0,-size.Y/2,0)):ToObjectSpace(rootPart.CFrame).Y
+	local rigHeightScale = rootPart.Size.Y / 2
+	
+	local rRootC0 = CFrame.new(torso.Size.X/4, -torso.Size.Y/2, 0)
+	local rTargetC0 = CFrame.new(rRootC0.X, 0.175 * rigHeightScale - 0.025, 0)
+	
+	local lRootC0 = CFrame.new(-torso.Size.X/4, -torso.Size.Y/2, 0)
+	local lTargetC0 = CFrame.new(lRootC0.X, 0.175 * rigHeightScale - 0.025, 0)
+	
+	return {
+		RootController = {
+			C0 = CFrame.new(), C1 = CFrame.new(0, rootOffsetFromGround - 0.025, 0)
+		},
+		RootJoint = {
+			C0 = CFrame.new(0, rootOffsetFromGround - 0.025, 0,   -1, 0, 0, 0, 0, 1, 0, 1, 0),
+			C1 = CFrame.new(0,0,0,  -1, 0, 0, 0, 0, 1, 0, 1, 0)
+		},
+		RightLegRoot = {
+			C0 = rRootC0, C1 = CFrame.new()
+		},
+		LeftLegRoot = {
+			C0 = lRootC0, C1 = CFrame.new()
+		},
+		RightLegTarget = {
+			C0 = rTargetC0, C1 = CFrame.new()
+		},
+		LeftLegTarget = {
+			C0 = lTargetC0, C1 = CFrame.new()
+		},
+	}
+end
+
+return module

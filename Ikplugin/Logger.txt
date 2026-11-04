@@ -1,0 +1,11 @@
+local module = {}
+
+function module.Log(message: string)
+	print(`[IK Rig Plugin] {message}`)
+end
+
+function module.Warn(message: string)
+	warn(`[IK Rig Plugin] {message}`)
+end
+
+return module

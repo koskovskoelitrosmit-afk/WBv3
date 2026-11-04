@@ -1,0 +1,344 @@
+const Rigs = script.Parent.Parent.Rigs
+const RigUtils = require(script.Parent:WaitForChild("Rig"))
+const JointsData = require(script:WaitForChild("JointsData"))
+--const IKJointsCalc = require(script.IKJointsCalc)
+const SelectionService = game:GetService("Selection")
+const HistoryService = game:GetService("ChangeHistoryService")
+const Players = game:GetService("Players")
+const RunService = game:GetService("RunService")
+
+const IK_RIG_TAG = shared._IKRigGlobal.IKRig_Tag
+
+const Logger = shared._IKRigGlobal.classes.Logger
+
+local IK_Controls = script.Parent.Parent["IK-Controls"]
+
+local Load_WorldModel = script.RigLoadWorld
+
+local module = {}
+
+local function FindPartInModel(model: Model, name: string)
+	for _, v in model:GetDescendants() do
+		if v:IsA("BasePart") and v.Name == name then
+			return v
+		end
+	end
+end
+
+local function RemoveRegularOnlyJoints(rig: Model, rigType: "R6" | "R15")
+	local jointsToRemove = JointsData[rigType].Regular
+	
+	for _, joint in rig:GetDescendants() do
+		if joint:IsA("Motor6D") and jointsToRemove[joint.Name] then
+			joint.Parent = nil --do not use :Destroy() because it will lock joint's parent to null causing bugs
+		end
+	end
+end
+
+local function RemoveIkOnlyJoints(rig: Model, rigType: "R6" | "R15")
+	local jointsToRemove = JointsData[rigType].IK
+	
+	for _, joint in rig:GetDescendants() do
+		if joint:IsA("Motor6D") and jointsToRemove[joint.Name] then
+			joint.Parent = nil --do not use :Destroy() because it will lock joint's parent to null causing bugs
+		end
+	end
+end
+
+local function AddIkOnlyJoints(rig: Model, rigType: "R6" | "R15", jointsCFrames: {[string]: CFrame})
+	local jointsData = JointsData[rigType].IK
+	
+	for name, data in jointsData do
+		local newJoint = Instance.new("Motor6D")
+		newJoint.Name = name
+		
+		local Part0 = FindPartInModel(rig, data.Part0)
+		local Part1 = FindPartInModel(rig, data.Part1)
+		
+		if jointsCFrames and jointsCFrames[newJoint.Name] then
+			local d = jointsCFrames[name]
+			newJoint.C0 = d.C0
+			newJoint.C1 = d.C1
+		else
+			newJoint.C0 = data.C0
+			newJoint.C1 = data.C1
+		end
+		
+		newJoint.Part0 = Part0
+		newJoint.Part1 = Part1
+		
+		newJoint.Parent = Part0
+	end
+end
+
+local function AddRegularOnlyJoints(rig: Model, rigType: "R6" | "R15")
+	local jointsData = JointsData[rigType].Regular
+	
+	local joints, rigScale = nil, nil
+	if rigType == "R15" then
+		joints = RigUtils.GetIkJointsR15(rig)
+		rigScale = RigUtils.GetR15RigScale(rig)
+	else
+		joints = RigUtils.GetIkJointsR6(rig)
+	end
+	
+	for name, data in jointsData do
+		local newJoint = Instance.new("Motor6D")
+		newJoint.Name = name
+
+		local Part0 = FindPartInModel(rig, data.Part0)
+		local Part1 = FindPartInModel(rig, data.Part1)
+		
+		local c0, c1 = data.C0, data.C1
+		
+		if joints then
+			if name == "Root" then
+				c0 = CFrame.new(0, -rigScale.Y, 0)
+				c1 = CFrame.new(0, -rigScale.Y * 0.2, 0)
+			else
+				c0 = joints[name] and joints[name].C0 or c0
+				c1 = joints[name] and joints[name].C1 or c1
+			end
+			newJoint.C0 = c0
+			newJoint.C1 = c1
+		end
+
+		newJoint.Part0 = Part0
+		newJoint.Part1 = Part1
+
+		newJoint.Parent = Part0
+	end
+end
+
+local function AddBothOnlyJoints(rig: Model, rigType: "R6" | "R15")
+	local jointsData = JointsData[rigType].Both
+
+	for name, data in jointsData do
+		local newJoint = Instance.new("Motor6D")
+		newJoint.Name = name
+
+		local Part0 = FindPartInModel(rig, data.Part0)
+		local Part1 = FindPartInModel(rig, data.Part1)
+
+		newJoint.C0 = data.C0
+		newJoint.C1 = data.C1
+
+		newJoint.Part0 = Part0
+		newJoint.Part1 = Part1
+
+		newJoint.Parent = Part0
+	end
+end
+
+
+
+local function convertAnimConstraintToMotor6D(constraint)
+	local att0 = constraint.Attachment0
+	local att1 = constraint.Attachment1
+
+	if att0 and att1 and att0.Parent and att1.Parent then
+		local motor = Instance.new("Motor6D")
+		motor.Name = constraint.Name
+		motor.Part0 = att0.Parent
+		motor.Part1 = att1.Parent
+		motor.C0 = att0.CFrame
+		motor.C1 = att1.CFrame
+		motor.Parent = att0.Parent
+	end
+	
+	att0:Destroy()
+	att1:Destroy()
+	constraint:Destroy()
+end
+
+local function ReplaceNewR15Constraints(rig: Model)
+	for _, v in rig:GetDescendants() do
+		if v:IsA("AnimationConstraint") then
+			convertAnimConstraintToMotor6D(v)
+		elseif v:IsA("BallSocketConstraint") then
+			v:Destroy()
+		end
+	end
+end
+
+
+local function InitializeIK(rig: Model)
+	rig:AddTag(IK_RIG_TAG)
+	RigUtils.CreateIKControls(rig)
+end
+
+
+
+
+local function CreateRigWithUserId(UserId: number, RigType: "R6" | "R15")
+	local model = nil
+	
+	local success, result = pcall(function()
+		local humanoidDesc = Players:GetHumanoidDescriptionFromUserIdAsync(UserId)
+		model = Players:CreateHumanoidModelFromDescriptionAsync(humanoidDesc, Enum.HumanoidRigType[RigType])
+		model.Name = Players:GetNameFromUserIdAsync(UserId)
+	end)
+	
+	if not success then
+		Logger.Warn("Failed to create rig with user id " .. UserId .. ": " .. result)
+		return
+	end
+	
+	for _, v in model:GetDescendants() do
+		if v:IsA("BaseScript") then v:Destroy() elseif v:IsA("BasePart") then v.Locked = false end
+	end
+	
+	model.PrimaryPart = model:FindFirstChild("HumanoidRootPart")
+	model.PrimaryPart.Anchored = true
+	model.Humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+	
+	
+	--[[the joints in the rig need to be in a world model or the workspace to apply the cframes to the limbs,
+		so we can get the true size/cframe of the rig
+		because the rig parts will be scattered before it being loaded]]
+	model.Parent = Load_WorldModel
+	model:PivotTo(CFrame.new())
+	
+	RunService.Heartbeat:Wait() -- make sure it rendered the rig
+	
+	if not module.IkifyRig(model) then
+		model:Destroy()
+		return
+	end
+	
+	return model
+end
+
+
+local function CreateTemplateRig(IK: boolean, Type: "R6" | "R15")
+	local rig = Rigs:WaitForChild(Type .. " Rig"):Clone()
+	AddBothOnlyJoints(rig, Type)
+	if IK then
+		InitializeIK(rig)
+		AddIkOnlyJoints(rig, Type)
+	else
+		AddRegularOnlyJoints(rig, Type)
+	end
+	return rig
+end
+
+
+
+
+function module.IkifyRig(rig: Model)
+	local rigType = RigUtils.GetRigType(rig)
+	if not rigType then warn("Invalid Plugin Type 0") return false end
+	
+	if not (rig:FindFirstAncestorOfClass("Workspace") or rig:FindFirstAncestorOfClass("WorldModel")) then
+		Logger.Warn("Rig must be inside workspace to be ikified")
+		return false
+	end
+	
+	HistoryService:SetWaypoint("IKRigPlugin/PreIKifyRig")
+	
+	rig:PivotTo(rig:GetPivot())
+	
+	local jointsCFrames = nil
+	if rigType == "R15" then
+		ReplaceNewR15Constraints(rig)
+		RigUtils.CreateIkAttachments(rig)
+		jointsCFrames = RigUtils.CalcR15IkControlsCframes(rig)
+	else
+		RigUtils.CreateIkAttachments(rig)
+		jointsCFrames = RigUtils.CalcR6IkControlsCframes(rig)
+	end
+	
+	InitializeIK(rig)
+	RemoveRegularOnlyJoints(rig, rigType)
+	AddIkOnlyJoints(rig, rigType, jointsCFrames)
+	
+	rig:PivotTo(rig:GetPivot())
+	
+	HistoryService:SetWaypoint("IKRigPlugin/IKifyRig")
+	
+	return true
+end
+
+
+
+function module.DeIkifyRig(rig: Model)
+	local rigType = RigUtils.GetRigType(rig)
+	if not rigType then return end
+	
+	local jointsCFrames = nil
+	if rigType == "R15" then
+		jointsCFrames = RigUtils.GetIkJointsR15(rig)
+	else
+		jointsCFrames = RigUtils.GetIkJointsR6(rig)
+	end
+	
+	rig:RemoveTag(IK_RIG_TAG)
+	RigUtils.RemoveIKControls(rig)
+	RigUtils.RemoveIkAttachments(rig)
+	RemoveIkOnlyJoints(rig, rigType)
+	AddRegularOnlyJoints(rig, rigType, jointsCFrames)
+end
+
+
+
+
+
+
+function module.CreateR6Rig(IK: boolean, UserId: number?) : Model
+	return UserId and CreateRigWithUserId(UserId, "R6") or CreateTemplateRig(IK, "R6")
+end
+
+function module.CreateR15Rig(IK: boolean, UserId: number?) : Model
+	return UserId and CreateRigWithUserId(UserId, "R15") or CreateTemplateRig(IK, "R15")
+end
+
+
+
+
+
+
+function module.CreateRegularRigCopy(rig: Model)
+	local newRig = rig:Clone()
+	
+	if rig:HasTag(IK_RIG_TAG) then
+		module.DeIkifyRig(newRig)
+	end
+	
+	return newRig
+end
+
+
+
+
+
+
+
+function module.PlaceRig(rig: Model, parent: any?)
+	local camCF = workspace.CurrentCamera.CFrame
+	local pos = workspace:Raycast(camCF.Position, camCF.LookVector * 25)
+	pos = pos and pos.Position + Vector3.new(0, 3, 0) or (camCF.Position + camCF.LookVector * 20)
+	
+	rig:PivotTo(CFrame.new(pos))
+	rig.Parent = parent or workspace
+end
+
+
+function module.SpawnRig(IK: boolean, Type: "R6" | "R15", UserId: number?)
+	Type = Type or "R6"
+
+	local newRig = Type == "R6" and module.CreateR6Rig(IK, UserId) or module.CreateR15Rig(IK, UserId)
+
+	HistoryService:SetWaypoint("IKRigPlugin/PreInsertRig")
+
+	module.PlaceRig(newRig, workspace)
+
+	SelectionService:Set({newRig})
+
+	HistoryService:SetWaypoint("IKRigPlugin/InsertRig")
+
+	return newRig
+end
+
+
+
+return module

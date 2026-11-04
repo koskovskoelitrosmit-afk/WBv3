@@ -1,0 +1,298 @@
+
+
+
+local global = shared._IKRigGlobal
+local toolbar = global.toolbar
+local guiUtil = global.utils.Gui
+local RIG_TAG = global.IKRig_Tag
+local selection = global.utils.Selection
+local rigUtils = global.utils.Rig
+local RigGenerator = global.utils.RigGenerator
+local UserUtils = global.utils.UserUtils
+local DDL = global.classes.DropDownList
+local Button = global.classes.Button
+
+local tweenService = game:GetService("TweenService")
+
+local localUserId = global.userId
+
+local ToolController = global.classes.PluginToolController.new(toolbar, {
+	Name = "Insert Rig",
+	Description = "Insert IK Rig",
+	Icon = "rbxassetid://107441113309927"
+})
+
+
+-- drag :D
+global.classes.DraggableUI.new(guiUtil.GetFrame("RigInsertionFrame").WinHeader.DragArea, guiUtil.GetFrame("RigInsertionFrame"))
+
+ToolController:BindToolButton(function(init)
+	if init then
+		return guiUtil.GetFrame("RigInsertionFrame").Visible
+	end
+	return guiUtil.ToggleFrame("RigInsertionFrame")
+end, true)
+
+
+ToolController:RegisterEvent(guiUtil.GetFrame("RigInsertionFrame").WinHeader.WinClose.MouseButton1Click, function()
+	guiUtil.GetFrame("RigInsertionFrame").Visible = false
+	ToolController:UpdateToolButton(false)
+end)
+
+local Processing = false
+
+-------------------------------------
+---- USER ID BASED RIG INSERTION ----
+
+local LoadedUserData = nil
+
+local function LoadUserData(text)
+	if not pcall(function()
+			LoadedUserData = UserUtils.GetUserData(tonumber(text))
+		end)
+	then
+		LoadedUserData = nil
+	end
+end
+
+local accountSelectFrame = guiUtil.GetFrame("RigInsertionFrame"):WaitForChild("AccountSelect")
+local loadedUserFrame = accountSelectFrame:WaitForChild("LoadedUser")
+local ddlTextBox = accountSelectFrame:WaitForChild("DDL") :: TextBox
+local ddlArrow = ddlTextBox:WaitForChild("DDL_ARROW") :: ImageLabel
+local ddlList = ddlTextBox:WaitForChild("List")
+local TEMPLATE = script:WaitForChild("Template")
+
+local accountDDL = DDL.new(ddlList, 6, TEMPLATE, function(item, value, select, remove)
+	local selectBtn = Button.new(item["DDL-SELECT"], {
+		HoverModifiers = {Size = 1, Brightness = 1.275},
+		DownModifiers = {Size = 1, Brightness = 0.725}
+	})
+	local removeBtn = Button.new(item["DDL-REMOVE"], {
+		HoverModifiers = {Size = 1, Brightness = 1.275},
+		DownModifiers = {Size = 1, Brightness = 0.725}
+	})
+	
+	pcall(function()
+		if value == localUserId and localUserId ~= "0" then
+			item.Label.Text = "You"
+			item.Label.TextColor3 = Color3.fromRGB(106, 163, 255)
+		else
+			item.Label.Text = "Loading"
+			item.Label.Text = UserUtils.GetUsername(tonumber(value))
+		end
+		item.Pfp.Image = UserUtils.GetUserThumbnail(tonumber(value))
+	end)
+	
+	selectBtn.Click:Connect(select)
+	if value ~= localUserId and localUserId ~= "0" then
+		removeBtn.Click:Once(function()
+			remove()
+			ddlTextBox:CaptureFocus()
+			UserUtils.RemoveRigInsertionUser(value)
+		end)
+	end
+end)
+
+
+if localUserId ~= "0" then accountDDL:AddItem(localUserId) end
+for _, userId in UserUtils.GetRigInsertionSavedUsers() do
+	accountDDL:AddItem(userId)
+end
+
+local ddlTextboxUICorner = ddlTextBox:FindFirstChildWhichIsA("UICorner")
+ToolController:RegisterEvent(accountDDL.OpenChanged, function(isOpened)
+	local tweenInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	tweenService:Create(ddlArrow,
+		tweenInfo,
+		{Rotation = isOpened and 0 or 180}
+	):Play()
+	
+	tweenService:Create(ddlTextboxUICorner, tweenInfo, {
+		BottomLeftRadius = isOpened and UDim.new(0, 1) or UDim.new(1, 0),
+		BottomRightRadius = isOpened and UDim.new(0, 1) or UDim.new(1, 0)
+	}):Play()
+end)
+
+ToolController:RegisterEvent(ddlTextBox.Focused, function()
+	if Processing then ddlTextBox:ReleaseFocus() return end
+	accountDDL:Open()
+end)
+
+ToolController:RegisterEvent(ddlTextBox.FocusLost, function()
+	if not guiUtil.IsPointInGuiObject(ddlList, Vector2.new(global.mouse.X, global.mouse.Y)) then
+		accountDDL:Close()
+	end
+end)
+
+ToolController:RegisterEvent(accountDDL.Selected, function(value)
+	ddlTextBox.Text = value or ""
+end)
+
+local function UpdateLoadedAccountFrame()
+	loadedUserFrame.Label.Text = "Loading..."
+	
+	LoadUserData(ddlTextBox.Text)
+	
+	if LoadedUserData then
+		loadedUserFrame.Label.Text = "@" .. LoadedUserData.Username
+		loadedUserFrame.Pfp.Image = LoadedUserData.Picture
+	else
+		loadedUserFrame.Label.Text = "Template Rig"
+		loadedUserFrame.Pfp.Image = "rbxassetid://18600791179"
+	end
+end
+
+ToolController:RegisterEvent(ddlTextBox:GetPropertyChangedSignal("Text"), function()
+	local text = ddlTextBox.Text
+	if accountDDL:GetSelectedItem() ~= text then
+		if accountDDL:DoesItemExist(text) then
+			accountDDL:SelectItemAndDontFire(text)
+		else
+			accountDDL:SelectItemAndDontFire(nil)
+		end
+	end
+	
+	UpdateLoadedAccountFrame()
+end)
+UpdateLoadedAccountFrame()
+
+--------------------------------------------------------------------------
+---- ik-ify an already existing selected rig
+
+local rigToIkify = nil
+ToolController:RegisterEvent(selection.SelectionChanged, function()
+	local rig = selection.GetFirst()
+	local rigType = rigUtils.GetRigType(rig)
+	local isIkRig = rigUtils.ValidateRigWithIK(rig)
+	
+	local r6Btn, r15Btn = guiUtil.GetButton("InsertR6"), guiUtil.GetButton("InsertR15")
+	local sizeTweenDetails = {Time = 0.24, Style = "Quad", Direction = "Out"}
+	local contentTweenDetails = {Time = 0.22, Style = "Sine", Direction = "InOut"}
+	
+	if not rigType or isIkRig then
+		if rigToIkify == nil then return end
+		rigToIkify = nil
+		contentTweenDetails.Time = 0.14
+		r6Btn:Tween({Size = UDim2.fromOffset(125, 24)}, sizeTweenDetails).Play()
+		r15Btn:Tween({Size = UDim2.fromOffset(125, 24)}, sizeTweenDetails).Play()
+		r6Btn:SetContent("Insert R6", contentTweenDetails)
+		r15Btn:SetContent("Insert R15", contentTweenDetails)
+	elseif not rigToIkify then
+		rigToIkify = rig
+		r6Btn:Tween({Size = UDim2.fromOffset(267, 24)}, sizeTweenDetails).Play()
+		r15Btn:Tween({Size = UDim2.fromOffset(267, 24)}, sizeTweenDetails).Play()
+		r6Btn:SetContent("IK-ify selected Rig", contentTweenDetails)
+		r15Btn:SetContent("IK-ify selected Rig", contentTweenDetails)
+	end
+end)
+
+
+--------------------------------------------------------------------------
+
+local function InsertRig(rigType)
+	local userId = LoadedUserData and tostring(LoadedUserData.Id) or nil
+	if userId and userId ~= "0" and userId ~= localUserId then
+		UserUtils.SaveRigInsertionUser(userId)
+		accountDDL:AddItem(userId)
+	end
+	RigGenerator.SpawnRig(true, rigType, userId)
+end
+
+local function IkifyRig(rig)
+	Processing = true
+	
+	rigToIkify = nil
+	RigGenerator.IkifyRig(rig)
+	
+	Processing = false
+end
+
+
+
+
+
+
+local insertR6Btn, insertR15Btn = guiUtil.GetButton("InsertR6"), guiUtil.GetButton("InsertR15")
+
+ToolController:RegisterEvent(insertR6Btn.Click, function()
+	if Processing then return end
+	Processing = true
+	if accountDDL:IsOpen() then accountDDL:Close() end
+	
+	local success, result = pcall(function()
+		if rigToIkify then
+			insertR6Btn:SetContent("IK-ifying...", {Time = 0.125})
+			insertR15Btn:SetContent("IK-ifying...", {Time = 0.125})
+			IkifyRig(rigToIkify)
+		else
+			insertR6Btn:SetContent("Inserting...", {Time = 0.125})
+			InsertRig("R6")
+		end
+	end)
+	
+	if not success then
+		warn(result)
+	end
+	
+	insertR6Btn:SetContent("Insert R6", {Time = 0.125}); insertR15Btn:SetContent("Insert R15", {Time = 0.125})
+	insertR6Btn:Tween({Size = UDim2.fromOffset(125, 24)}, {Time = 0.24, Style = "Quad", Direction = "Out"}).Play()
+	insertR15Btn:Tween({Size = UDim2.fromOffset(125, 24)}, {Time = 0.24, Style = "Quad", Direction = "Out"}).Play()
+	
+	guiUtil.ToggleFrame("RigInsertionFrame", false)
+	ddlTextBox.Text = ""
+	ToolController:UpdateToolButton(false)
+	
+	Processing = false
+end)
+
+
+ToolController:RegisterEvent(insertR15Btn.Click, function()
+	if Processing then return end
+	Processing = true
+	if accountDDL:IsOpen() then accountDDL:Close() end
+
+	local success, result = pcall(function()
+		if rigToIkify then
+			insertR6Btn:SetContent("IK-ifying...", {Time = 0.125})
+			insertR15Btn:SetContent("IK-ifying...", {Time = 0.125})
+			IkifyRig(rigToIkify)
+		else
+			insertR15Btn:SetContent("Inserting...", {Time = 0.125})
+			InsertRig("R15")
+		end
+	end)
+
+	if not success then
+		warn(result)
+	end
+
+	insertR6Btn:SetContent("Insert R6", {Time = 0.125}); insertR15Btn:SetContent("Insert R15", {Time = 0.125})
+	insertR6Btn:Tween({Size = UDim2.fromOffset(125, 24)}, {Time = 0.24, Style = "Quad", Direction = "Out"}).Play()
+	insertR15Btn:Tween({Size = UDim2.fromOffset(125, 24)}, {Time = 0.24, Style = "Quad", Direction = "Out"}).Play()
+
+	guiUtil.ToggleFrame("RigInsertionFrame", false)
+	ddlTextBox.Text = ""
+	ToolController:UpdateToolButton(false)
+
+	Processing = false
+end)
+
+
+
+ToolController:BindToUnload(function()
+	local savedUsers = UserUtils.GetRigInsertionSavedUsers()
+	global.SetSetting("SavedUsers_RIG_INSERTION", savedUsers)
+	global = nil
+	Processing = nil
+	insertR6Btn = nil
+	insertR15Btn = nil
+	ToolController = nil
+	accountDDL = nil
+	guiUtil = nil
+	toolbar = nil
+	RIG_TAG = nil
+	RigGenerator = nil
+end)
+
+
+return ToolController

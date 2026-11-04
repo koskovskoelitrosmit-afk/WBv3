@@ -1,0 +1,82 @@
+local function SafeUnit(vector: Vector3)
+	if vector.Magnitude == 0 then
+		return Vector3.zero
+	end
+	return vector.Unit
+end
+
+local module = {}
+
+function module.CalcR6(Root: CFrame, Target: CFrame, LegLength: number)
+	local TargetPosition = Target.Position
+	local rootPosition = Root.Position
+
+	local L1 = LegLength * 0.35
+	local L2 = LegLength - L1
+
+	local Distance = (rootPosition - TargetPosition).Magnitude
+	
+	local angle = math.acos(math.clamp((L1^2 + Distance^2 - L2^2)/(2 * L1 * Distance), -1, 1))
+
+	local PlaneDirection = Target.LookVector
+
+	local KneePoint = CFrame.lookAt(rootPosition, TargetPosition, PlaneDirection) * CFrame.Angles(angle, 0, 0) * CFrame.new(0, 0, -L1)
+	local FootPoint = CFrame.lookAt(KneePoint.Position, TargetPosition) * CFrame.new(0, 0, -L2)
+
+	local UpVector = SafeUnit(KneePoint.Position - FootPoint.Position)
+	local RightVector = SafeUnit(PlaneDirection:Cross(UpVector))
+	local LegPosition = (FootPoint * CFrame.new(0, 0, LegLength/2)).Position
+
+	local LegCFrame = CFrame.fromMatrix(LegPosition, RightVector, UpVector)
+
+
+	return LegCFrame
+end
+
+function module.CalcR15(Root: CFrame, Target: CFrame, Joints: {[string]: {C0: CFrame, C1: CFrame}}, L1: number, L2: number, FootLength: number)
+	local TargetPosition = Target.Position
+	local rootPosition = Root.Position
+	
+	local Distance = (rootPosition - TargetPosition).Magnitude
+	
+	local bendAngle = math.acos(math.clamp((L1^2 + Distance^2 - L2^2)/(2 * L1 * Distance), -1, 1))
+	--local bendAngle2 = math.acos(math.clamp((Distance^2 + L2^2 - L1^2)/(2 * L2 * Distance), -1, 1))
+	
+	local PlaneDirection = -SafeUnit(Root.RightVector:Cross(rootPosition - TargetPosition))
+	--local upVector = SafeUnit(rootPosition - TargetPosition)
+	
+	--local ulCf = CFrame.fromMatrix(rootPosition, Root.LookVector:Cross(upVector), upVector) * CFrame.Angles(bendAngle, 0, 0) * Joints.Hip.C1:Inverse()
+	--local llCf = ulCf * Joints.Knee.C0 * CFrame.Angles(-bendAngle2 - bendAngle, 0, 0) * Joints.Knee.C1:Inverse()
+	--local footCf = CFrame.fromMatrix((llCf * Joints.Ankle.C0 * Joints.Ankle.C1:Inverse()).Position,
+	--	Target.RightVector, Target.UpVector)
+	
+	--return ulCf, llCf, footCf
+	
+	local UpperLegCFrame = CFrame.lookAt(rootPosition, TargetPosition, PlaneDirection) 
+		* CFrame.Angles(bendAngle, 0, 0) * CFrame.new(0, 0, -Joints.Hip.C1.Y)
+	local KneeCFrame = UpperLegCFrame * CFrame.new(0, 0, Joints.Knee.C0.Y)
+	local LowerLegCFrame = CFrame.lookAt(KneeCFrame.Position, TargetPosition) * CFrame.new(0, 0, -Joints.Knee.C1.Y)
+	local AnkleCFrame = LowerLegCFrame * CFrame.new(0, 0, Joints.Ankle.C0.Y)
+	local FootCFrame = CFrame.lookAt(KneeCFrame.Position, TargetPosition) * CFrame.new(0, 0, -L2)
+	
+	--- Hip
+	local Hip_UpVector = SafeUnit(rootPosition - KneeCFrame.Position)
+	local Hip_RightVector = SafeUnit(PlaneDirection:Cross(Hip_UpVector))
+	if bendAngle >= math.pi/2 then Hip_RightVector = -Hip_RightVector end
+	
+	local HipCFrame = CFrame.fromMatrix(UpperLegCFrame.Position, Hip_RightVector, Hip_UpVector)
+	
+	--- Leg
+	local Leg_UpVector = SafeUnit(KneeCFrame.Position - AnkleCFrame.Position)
+	local Leg_RightVector = SafeUnit(PlaneDirection:Cross(Leg_UpVector))
+	
+	local LegCFrame = CFrame.fromMatrix(LowerLegCFrame.Position, Leg_RightVector, Leg_UpVector)
+	
+	--- Foot
+	local FootPosition = FootCFrame.Position + Target.UpVector * FootLength/2
+	local FootCFrame = CFrame.fromMatrix(FootPosition, Target.RightVector, Target.UpVector)
+	
+	return HipCFrame, LegCFrame, FootCFrame
+end
+
+return module

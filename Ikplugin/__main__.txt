@@ -1,0 +1,92 @@
+
+
+if shared._IKRigGlobal then
+	shared._IKRigGlobal._running = false
+
+	local toolbar = plugin:CreateToolbar("IK Tools [restart required]")
+	toolbar:CreateButton("", "Restart Studio", "")
+	return
+end
+
+const toolbar = plugin:CreateToolbar("IK Tools")
+
+local global = {
+	_running = false,
+	plugin = plugin,
+	mouse = plugin:GetMouse(),
+	userId = tostring(game:GetService("StudioService"):GetUserId()),
+	toolbar = toolbar,
+	classes = {},
+	utils = {},
+	state = {
+		ikActive = false,
+		activeRigs = {},
+		ikConnection = nil,
+		processing = false
+	},
+	IKRig_Tag = "R6IKRig_TAG",
+	FPS = 60,
+
+	GetSetting = function(key: string)
+		return plugin:GetSetting(key)
+	end,
+	SetSetting = function(key: string, value: any)
+		plugin:SetSetting(key, value)
+	end,
+}
+shared._IKRigGlobal = global
+
+
+task.defer(function()
+	global._running = true
+end)
+
+
+
+
+local ToolsControllers = {}
+
+plugin.Unloading:Once(function()
+	global._running = false
+	global.state.ikActive = false
+	if global.state.ikConnection then
+		global.state.ikConnection:Disconnect()
+	end
+
+	for _, controller in ToolsControllers do
+		controller:Unload()
+	end
+
+	shared._IKRigGlobal = nil
+end)
+
+
+
+--// Load Modules
+
+local function LoadTool(module: ModuleScript)
+	assert(module:IsA("ModuleScript"), `Tool {module} is not valid`)
+	task.spawn(function()
+		table.insert(ToolsControllers, require(module))
+	end)
+end
+
+local function LoadUtility(module: ModuleScript)
+	assert(module:IsA("ModuleScript"), `Utility {module} is not valid`)
+	global.utils[module.Name] = require(module)
+end
+
+local function LoadClass(module: ModuleScript)
+	assert(module:IsA("ModuleScript"), `Class {module} is not valid`)
+	global.classes[module.Name] = require(module)
+end
+
+
+
+local utils = script.Parent.Utils
+local classes = script.Parent.Classes
+for _, class in classes:GetChildren() do LoadClass(class) end
+for _, utility in utils:GetChildren() do LoadUtility(utility) end
+
+local tools = script.Parent.Tools
+for _, tool in tools:GetChildren() do LoadTool(tool) end

@@ -1,0 +1,42 @@
+
+
+
+local global = shared._IKRigGlobal
+local toolbar = global.toolbar
+local guiUtil = global.utils.Gui
+
+local ToolController = global.classes.PluginToolController.new(toolbar, {
+	Name = "Toggle Gui",
+	Description = "Toggles Gui",
+	Icon = "rbxassetid://4483364237"
+})
+
+
+
+
+
+local gui = guiUtil.GetGui()
+
+
+
+local function update(init)
+	if not gui then return end
+	if init then return gui.Enabled end
+	return guiUtil.ToggleGui()
+end
+
+
+ToolController:BindToolButton(update, true)
+
+
+ToolController:BindToUnload(function()
+	guiUtil.Destroy()
+	global = nil
+	toolbar = nil
+	guiUtil = nil
+	ToolController = nil
+	gui = nil
+end)
+
+
+return ToolController

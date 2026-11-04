@@ -1,0 +1,296 @@
+const global = shared._IKRigGlobal
+const RigUtils = global.utils.Rig
+const Queue = global.classes.Queue
+const FPS = global.FPS
+
+const RunService = game:GetService("RunService")
+
+const Easing = require(script:WaitForChild("Easing"))
+
+const WaitAfterLoops_Clone = 25       -- GenerateEmptyKeyframes
+const WaitAfterLoops_StoreKeyframes = 30  -- keyframe iteration / StorePoses
+const WaitAfterLoops_CFrames = 18     -- GenerateCFrames apply loop
+const WaitAfterLoops_Parenting = 1    -- final AddKeyframe loop
+
+-------------------------------------------------------
+---- Utils
+
+local function SecondsToFrames(s: number)
+	return math.round(s * FPS)
+end
+local function FramesToSeconds(f: number)
+	return f / FPS
+end
+
+-------------------------------------------------------
+
+local function GenerateCFrames(Pose1: {}, Pose2: {})
+	local Count = SecondsToFrames(Pose2.Time - Pose1.Time)
+
+	local CFrames = {}
+
+	for i = 0, Count - 1 do
+		local t = Easing.Calculate(Pose1.Style, {Direction = Pose1.Direction}, i / Count)
+		CFrames[i] = Pose1.CFrame:Lerp(Pose2.CFrame, t)
+	end
+
+	return CFrames
+end
+
+
+local function BuildKeyframeBlueprint(anim: KeyframeSequence | CurveAnimation)
+	local Blueprint = {}
+
+	local function build(Parent: {}, Poses: {Pose})
+		for _, pose in Poses do
+			if not Parent[pose.Name] then
+				Parent[pose.Name] = {}
+			end
+
+			build(Parent[pose.Name], pose:GetSubPoses())
+		end
+	end
+	
+	local function buildCurve(Parent: {}, Poses: {Folder})
+		for _, pose in Poses do
+			if not pose:IsA("Folder") then continue end
+			if not Parent[pose.Name] then
+				Parent[pose.Name] = {}
+			end
+
+			buildCurve(Parent[pose.Name], pose:GetChildren())
+		end
+	end
+	
+	if anim:IsA("KeyframeSequence") then
+		for _, keyframe in anim:GetKeyframes() do
+			build(Blueprint, keyframe:GetPoses())
+		end
+	elseif anim:IsA("CurveAnimation") then
+		buildCurve(Blueprint, anim:GetChildren())
+	end
+
+	return Blueprint
+end
+
+
+local function BuildKeyframe(KeyframeBlueprint)
+	local Keyframe = Instance.new("Keyframe")
+
+	local function build(Parent: Keyframe | Pose, Blueprint)
+		for poseName, children in Blueprint do
+			local pose = Instance.new("Pose")
+			pose.Name = poseName
+			pose.Parent = Parent
+			build(pose, children)
+		end
+	end
+
+	build(Keyframe, KeyframeBlueprint)
+
+	return Keyframe
+end
+
+
+
+local function GenerateEmptyKeyframes(count: number, blueprint: {})
+	local Keyframes = {}
+
+	local templateKeyframe = BuildKeyframe(blueprint)
+
+	for t = 0, count - 1 do
+		if t%WaitAfterLoops_Clone == 0 then
+			task.wait()
+		end
+
+		local keyframe = templateKeyframe:Clone()
+		keyframe.Time = FramesToSeconds(t)
+		Keyframes[t] = keyframe
+	end
+
+	return Keyframes
+end
+
+
+local function SortKeyframes(Keyframes: {Keyframe})
+	table.sort(Keyframes, function(a, b)
+		return a.Time < b.Time
+	end)
+	return Keyframes
+end
+
+
+local function StorePoses(StorageRef: {}, poses: {Pose}, t: number)
+	for _, pose: Pose in poses do
+		StorePoses(StorageRef, pose:GetSubPoses(), t)
+
+		if pose.Weight <= 0 then continue end
+
+		local stored = StorageRef[pose.Name]
+		if not stored then
+			stored = Queue.new()
+			StorageRef[pose.Name] = stored
+		end
+
+		stored:Enqueue({
+			CFrame = pose.CFrame,
+			Style = pose.EasingStyle.Name,
+			Direction = pose.EasingDirection.Name,
+			Time = t
+		})
+	end
+end
+
+
+local function ApplyDataToPose(keyframe: Keyframe, poseName: string, Cframe: CFrame, weight: number)
+	local pose = keyframe:FindFirstChild(poseName, true)
+	if not pose then return end
+	pose.CFrame = Cframe
+end
+
+
+
+
+----------------------------------------------------------------------------------------------
+-------- MAIN CONVERTER FUNCTION
+
+const PosesUtils = require(script.Parent.IkPoses)
+
+
+
+local function ConvertAnimation(Anim: KeyframeSequence, IkRig: Model)
+	local KeyframeBlueprint = BuildKeyframeBlueprint(Anim)
+	local FramesCount = SecondsToFrames(Anim.Length) + 1
+
+	--index = frame, starts from index 0
+	local GeneratedKeyframes = GenerateEmptyKeyframes(FramesCount, KeyframeBlueprint)
+
+	local StoredPoses = {} :: {typeof(Queue)}
+	local Keyframes = SortKeyframes(Anim:GetKeyframes())
+
+	local i = 1
+	for _, keyframe in Keyframes do
+		if i%WaitAfterLoops_StoreKeyframes == 0 then
+			task.wait()
+		end
+
+		local generatedFrame = GeneratedKeyframes[SecondsToFrames(keyframe.Time)]
+		generatedFrame.Name = keyframe.Name
+
+		for _, marker in keyframe:GetMarkers() do
+			marker:Clone().Parent = generatedFrame
+		end
+
+		StorePoses(StoredPoses, keyframe:GetPoses(), keyframe.Time)
+		i += 1
+	end
+	i = 0
+
+	for poseName, poses in StoredPoses do
+		while not poses:IsEmpty() do
+			if i%WaitAfterLoops_CFrames == 0 then
+				task.wait()
+			end
+
+			local pose1 = poses:Dequeue()
+			local pose2 = poses:Peek() or {CFrame = pose1.CFrame, Time = FramesToSeconds(FramesCount)}
+
+			local startFrame = SecondsToFrames(pose1.Time)
+
+			local CFrames = GenerateCFrames(pose1, pose2)
+			for frame, cframe in CFrames do
+				ApplyDataToPose(GeneratedKeyframes[startFrame + frame], poseName, cframe)
+			end
+
+			i += 1
+		end
+	end
+	i = 0
+	StoredPoses = nil
+	Keyframes = nil
+	KeyframeBlueprint = nil
+
+	-----
+
+	local newAnim = Instance.new("KeyframeSequence")
+	newAnim.Name = Anim.Name
+	newAnim.Loop = Anim.Loop
+
+	local RigType = RigUtils.GetRigType(IkRig)
+	local RigCache = PosesUtils.BuildRigCache(IkRig, RigType) -- much less lag
+	for _, keyframe in GeneratedKeyframes do
+		RunService.Heartbeat:Wait()
+
+		if RigType == "R6" then
+			PosesUtils.BakePoses_R6(keyframe, IkRig, RigCache)
+		else
+			PosesUtils.BakePoses_R15(keyframe, IkRig, RigCache)
+		end
+		newAnim:AddKeyframe(keyframe)
+
+	end
+	RigCache = nil
+
+	return newAnim
+end
+
+
+function ConvertCurve(Anim: CurveAnimation, IkRig: Model)
+	local FramesCount = SecondsToFrames(Anim.Length) + 1
+
+	--index = frame, starts from index 0
+	local bb = BuildKeyframeBlueprint(Anim)
+	local GeneratedKeyframes = GenerateEmptyKeyframes(FramesCount, bb)
+	
+	local function GetCFrameAtTime(pose, t)
+		local posCurve, rotCurve =
+			pose:FindFirstChild("Position"):: Vector3Curve,
+			pose:FindFirstChild("Rotation") :: EulerRotationCurve
+		
+		local position = posCurve and posCurve:GetValueAtTime(t) or {0, 0, 0}
+		local rotation = rotCurve and rotCurve:GetAnglesAtTime(t) or {0, 0, 0}
+		
+		return CFrame.new(position[1], position[2], position[3]) * CFrame.Angles(rotation[1], rotation[2], rotation[3])
+	end
+	
+	
+	for _, pose in Anim:GetDescendants() do
+		if not pose:IsA("Folder") then continue end
+
+		local poseName = pose.Name
+		for frame = 0, FramesCount - 1 do
+			local keyframe = GeneratedKeyframes[frame]
+			local cframe = GetCFrameAtTime(pose, FramesToSeconds(frame))
+			ApplyDataToPose(keyframe, poseName, cframe)
+		end
+	end
+	
+	
+
+	-----
+
+	local newAnim = Instance.new("KeyframeSequence")
+	newAnim.Name = Anim.Name
+	newAnim.Loop = Anim.Loop
+
+	local RigType = RigUtils.GetRigType(IkRig)
+	local RigCache = PosesUtils.BuildRigCache(IkRig, RigType) -- much less lag
+	for _, keyframe in GeneratedKeyframes do
+		RunService.Heartbeat:Wait()
+
+		if RigType == "R6" then
+			PosesUtils.BakePoses_R6(keyframe, IkRig, RigCache)
+		else
+			PosesUtils.BakePoses_R15(keyframe, IkRig, RigCache)
+		end
+		newAnim:AddKeyframe(keyframe)
+	end
+	RigCache = nil
+
+	return newAnim
+end
+
+return {
+	Convert = ConvertAnimation,
+	ConvertCurve = ConvertCurve,
+}

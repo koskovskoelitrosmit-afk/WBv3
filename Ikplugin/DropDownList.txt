@@ -1,0 +1,163 @@
+local tweenService = game:GetService("TweenService")
+
+local SIGNAL = require(script.Parent.Signal)
+
+local module = {}
+module.__index = module
+
+function module.new(frame: ScrollingFrame, maxDisplay: number, itemTemplate: GuiObject, itemInit: (btn: GuiButton, item: string) -> ())
+	local self = setmetatable({}, module)
+	
+	self.frame = frame
+	self.maxItemsDisplayed = maxDisplay
+	
+	self.isOpen = false
+	self.items = {}
+	self.selectedItem = nil
+	
+	self.itemTemplate = itemTemplate
+	self.itemSize = itemTemplate.Size
+	
+	self._initItem = itemInit
+	
+	self.Selected = SIGNAL.new()
+	self.OpenChanged = SIGNAL.new()
+	
+	self:init()
+	return self
+end
+
+function module:init()
+	for _, item in self.frame:GetChildren() do
+		if item:IsA("GuiObject") then
+			item:Destroy()
+		end
+	end
+	
+	self:Close()
+	
+	self.frame.Destroying:Once(function()
+		self:Destroy()
+	end)
+end
+
+function module:IsOpen()
+	return self.isOpen
+end
+
+function module:Close()
+	self.isOpen = false
+	self.OpenChanged:Fire(false)
+	self:Update()
+end
+
+function module:Open()
+	self.isOpen = true
+	self.OpenChanged:Fire(true)
+	self:Update()
+end
+
+function module:GetSelectedItem()
+	return self.selectedItem
+end
+
+function module:DoesItemExist(item: string)
+	return table.find(self.items, item) ~= nil
+end
+
+function module:SelectItem(item)
+	if item ~= nil and not self:DoesItemExist(item) then return end
+	
+	self:Close()
+	
+	if self.selectedItem ~= item then
+		self.selectedItem = item
+		self.Selected:Fire(item)
+	end
+end
+
+function module:SelectItemAndDontFire(item)
+	if item ~= nil and not self:DoesItemExist(item) then return end
+	if self.selectedItem ~= item then
+		self.selectedItem = item
+	end
+end
+
+function module:AddItem(item: string | {string})
+	if typeof(item) == "string" then
+		if self:DoesItemExist(item) then return end
+		table.insert(self.items, item)
+		
+		local btn = self.itemTemplate:Clone()
+		self._initItem(btn, item, function() self:SelectItem(item) end, function() self:RemoveItem(item) end)
+		
+		btn.Name = "ITEM_" .. item
+		btn.Parent = self.frame
+	elseif typeof(item) == "table" then
+		for _, v in item do
+			self:AddItem(v)
+		end
+	end
+end
+
+function module:RemoveItem(item: string | {string})
+	if typeof(item) == "string" then
+		local index = table.find(self.items, item)
+		if not index then return end
+		table.remove(self.items, index)
+		
+		local btn = self.frame:FindFirstChild("ITEM_" .. item)
+		if btn then btn:Destroy() end
+		
+		if self.selectedItem == item then
+			self:SelectItem(nil)
+		end
+		
+	elseif typeof(item) == "table" then
+		for _, v in item do
+			self:RemoveItem(v)
+		end
+	end
+	self:Update()
+end
+
+function module:Update()
+	if not self.isOpen or #self.items == 0 then
+		self.frame.CanvasSize = UDim2.fromOffset(0, 0)
+		tweenService:Create(
+			self.frame,
+			TweenInfo.new(0.2 * math.clamp(#self.items, 1, self.maxItemsDisplayed)/self.maxItemsDisplayed, 1),
+			{Size = UDim2.new(1, 0, 0, 0)}
+		):Play()
+		return
+	end
+	
+	local itemsSize = #self.items * self.itemSize.Y.Offset
+	local paddingTopDown = self.frame.UIPadding.PaddingTop.Offset + self.frame.UIPadding.PaddingBottom.Offset
+	local ListPadding = self.frame.UIListLayout.Padding.Offset
+	
+	local frameSize = math.min(itemsSize, self.maxItemsDisplayed * self.itemSize.Y.Offset)
+	frameSize += ListPadding * math.min(self.maxItemsDisplayed - 1, #self.items - 1)
+	frameSize += paddingTopDown
+	
+	local canvasSize = itemsSize + ListPadding * (#self.items - 1) + paddingTopDown
+	self.frame.CanvasSize = UDim2.fromOffset(0, canvasSize)
+	
+	tweenService:Create(
+		self.frame,
+		TweenInfo.new(0.2 * math.min(#self.items/self.maxItemsDisplayed, 1)),
+		{Size = UDim2.new(1, 0, 0, frameSize)}
+	):Play()
+end
+
+function module:Destroy()
+	self.Selected:DisconnectAll()
+	self.OpenChanged:DisconnectAll()
+	if self.frame and self.frame.Parent then
+		self.frame:Destroy()
+	end
+	setmetatable(self, nil)
+	for k in self do self[k] = nil end
+end
+
+return module

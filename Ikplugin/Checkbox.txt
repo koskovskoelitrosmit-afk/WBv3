@@ -1,0 +1,130 @@
+
+const ButtonClass = require(script.Parent.Button)
+const Signal = require(script.Parent.Signal)
+
+type checkBtnConfig = {
+	checkColor: Color3,
+	uncheckColor: Color3,
+	mixedColor: Color3
+}
+
+const DEFUALT_CONFIG: checkBtnConfig = {
+	checkColor = Color3.fromRGB(89, 155, 255),
+	uncheckColor = Color3.fromRGB(58, 60, 65),
+	mixedColor = Color3.fromRGB(73, 107, 160)
+}
+
+local module = setmetatable({}, ButtonClass)
+module.__index = module
+
+function module.new(btn: GuiButton, config: checkBtnConfig)
+	local self = setmetatable(ButtonClass.new(btn), module)
+	
+	self._checked = false
+	self._mixed = false
+	
+	self._config = {
+		checkColor = config and config.checkColor or DEFUALT_CONFIG.checkColor,
+		uncheckColor = config and config.uncheckColor or DEFUALT_CONFIG.uncheckColor,
+		mixedColor = config and config.mixedColor or DEFUALT_CONFIG.mixedColor
+	}
+	
+	self._binds = {}
+	
+	self.Changed = Signal.new()
+	
+	self:init()
+	return self
+end
+
+function module:init()
+	self.Click:Connect(function()
+		if self._mixed then
+			self._checked = true
+		else
+			self._checked = not self._checked
+		end
+		self._mixed = false
+		
+		self.Changed:Fire(self._checked, self._mixed)
+		self:Update()
+		
+		for _, bind in self._binds do
+			if not bind.Button or not bind.Button.Parent then
+				table.remove(self._binds, table.find(self._binds, bind))
+				continue
+			end
+			
+			bind._checked = self._checked
+			bind._mixed = self._mixed
+			bind:Update()
+		end
+		
+	end)
+end
+
+
+function module:Update()
+	local color = if self._mixed then
+		self._config.mixedColor else
+		self._checked and self._config.checkColor or self._config.uncheckColor
+	
+	self:Tween({BgColor = color}).Play()
+end
+
+
+
+
+function module:BindCheckbox(checkbox)
+	if table.find(self._binds, checkbox) then
+		return
+	end
+	
+	table.insert(self._binds, checkbox)
+	
+	local function updateBounds(checked, mixed)
+		if mixed then
+			self._mixed = true
+			self._checked = false
+		else
+			self._checked = checked
+			self._mixed = false
+
+			for _, bind in self._binds do
+				if bind ~= checkbox and bind._checked ~= checked then
+					self._mixed = true
+					self._checked = false
+					break
+				end
+			end
+		end
+		
+		self:Update()
+	end
+	
+	updateBounds(checkbox._checked, checkbox._mixed)
+	local connection = checkbox.Changed:Connect(updateBounds)
+	
+	return function()
+		if connection and connection.connected then
+			connection:Disconnect()
+		end
+		
+		local index = table.find(self._binds, checkbox)
+		if index then
+			table.remove(self._binds, index)
+		end
+	end
+end
+
+function module:IsChecked()
+	return self._checked
+end
+
+function module:SetChecked(checked: boolean)
+	self._checked = checked
+	self._mixed = false
+	self:Update()
+end
+
+return module

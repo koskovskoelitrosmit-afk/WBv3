@@ -1,0 +1,231 @@
+local R6JointsData = {
+	Both = {
+		["Neck"] = {
+			["Part0"] = "Torso",
+			["Part1"] = "Head",
+			C0 = CFrame.new(0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 1, -0),
+			C1 = CFrame.new(0, -0.5, 0, -1, 0, 0, 0, 0, 1, 0, 1, -0)
+		},
+		["Left Shoulder"] = {
+			["Part0"] = "Torso",
+			["Part1"] = "Left Arm",
+			C0 = CFrame.new(-1, 0.5, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+			C1 = CFrame.new(0.5, 0.5, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0)
+		},
+		["Right Shoulder"] = {
+			["Part0"] = "Torso",
+			["Part1"] = "Right Arm",
+			C0 = CFrame.new(1, 0.5, 0, 0, 0, 1, 0, 1, -0, -1, 0, 0),
+			C1 = CFrame.new(-0.5, 0.5, 0, 0, 0, 1, 0, 1, -0, -1, 0, 0)
+		}
+	},
+
+	Regular = {
+		["Left Hip"] = {
+			["Part0"] = "Torso",
+			["Part1"] = "Left Leg",
+			C0 = CFrame.new(-1, -1, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+			C1 = CFrame.new(-0.5, 1, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0)
+		},
+		["Right Hip"] = {
+			["Part0"] = "Torso",
+			["Part1"] = "Right Leg",
+			C0 = CFrame.new(1, -1, 0, 0, 0, 1, 0, 1, -0, -1, 0, 0),
+			C1 = CFrame.new(0.5, 1, 0, 0, 0, 1, 0, 1, -0, -1, 0, 0)
+		},
+		["RootJoint"] = {
+			["Part0"] = "HumanoidRootPart",
+			["Part1"] = "Torso",
+			C0 = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+			C1 = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0)
+		},
+	},
+
+	IK = {
+		["LeftLegTarget"] = {
+			["Part0"] = "RootController",
+			["Part1"] = "LeftLegTarget",
+			C0 = CFrame.new(-0.5, 0.15, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["RightLegTarget"] = {
+			["Part0"] = "RootController",
+			["Part1"] = "RightLegTarget",
+			C0 = CFrame.new(0.5, 0.15, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+
+		["LeftLegRoot"] = {
+			["Part0"] = "Torso",
+			["Part1"] = "LeftLegRoot",
+			C0 = CFrame.new(-0.5, -1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["RightLegRoot"] = {
+			["Part0"] = "Torso",
+			["Part1"] = "RightLegRoot",
+			C0 = CFrame.new(0.5, -1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		
+		["RootController"] = {
+			["Part0"] = "HumanoidRootPart",
+			["Part1"] = "RootController",
+			C0 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 2.975, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		
+		["RootJoint"] = {
+			["Part0"] = "RootController",
+			["Part1"] = "Torso",
+			C0 = CFrame.new( 0, 2.975, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+			C1 = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, -0)
+		},
+	}
+}
+
+local R15JointsData = {
+	Both = {
+		["Waist"] = {
+			["Part0"] = "LowerTorso",
+			["Part1"] = "UpperTorso",
+			C0 = CFrame.new(0, 0.2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, -0.8, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["Neck"] = {
+			["Part0"] = "UpperTorso",
+			["Part1"] = "Head",
+			C0 = CFrame.new(0, 0.8, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, -0.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["LeftShoulder"] = {
+			["Part0"] = "UpperTorso",
+			["Part1"] = "LeftUpperArm",
+			C0 = CFrame.new(-1, 0.563, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0.5, 0.394, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["LeftElbow"] = {
+			["Part0"] = "LeftUpperArm",
+			["Part1"] = "LeftLowerArm",
+			C0 = CFrame.new(0, -0.334, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0.258, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["LeftWrist"] = {
+			["Part0"] = "LeftLowerArm",
+			["Part1"] = "LeftHand",
+			C0 = CFrame.new(0, -0.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0.125, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["RightShoulder"] = {
+			["Part0"] = "UpperTorso",
+			["Part1"] = "RightUpperArm",
+			C0 = CFrame.new(1, 0.563, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(-0.5, 0.394, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["RightElbow"] = {
+			["Part0"] = "RightUpperArm",
+			["Part1"] = "RightLowerArm",
+			C0 = CFrame.new(0, -0.334, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0.258, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["RightWrist"] = {
+			["Part0"] = "RightLowerArm",
+			["Part1"] = "RightHand",
+			C0 = CFrame.new(0, -0.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0.125, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		}
+	},
+
+	Regular = {
+		["Root"] = {
+			["Part0"] = "HumanoidRootPart",
+			["Part1"] = "LowerTorso",
+			C0 = CFrame.new(0, -1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, -0.2, -0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["LeftHip"] = {
+			["Part0"] = "LowerTorso",
+			["Part1"] = "LeftUpperLeg",
+			C0 = CFrame.new(-0.5, -0.2, -0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0.4207, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["LeftKnee"] = {
+			["Part0"] = "LeftUpperLeg",
+			["Part1"] = "LeftLowerLeg",
+			C0 = CFrame.new(0, -0.4011, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0.379, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["LeftAnkle"] = {
+			["Part0"] = "LeftLowerLeg",
+			["Part1"] = "LeftFoot",
+			C0 = CFrame.new(0, -0.547, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0.101, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+
+		["RightHip"] = {
+			["Part0"] = "LowerTorso",
+			["Part1"] = "RightUpperLeg",
+			C0 = CFrame.new(0.5, -0.2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0.4207, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["RightKnee"] = {
+			["Part0"] = "RightUpperLeg",
+			["Part1"] = "RightLowerLeg",
+			C0 = CFrame.new(-0, -0.4011, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(-0, 0.379, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		},
+		["RightAnkle"] = {
+			["Part0"] = "RightLowerLeg",
+			["Part1"] = "RightFoot",
+			C0 = CFrame.new(-0, -0.547, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(-0, 0.101, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+		}
+	},
+
+
+	IK = {
+		["Root"] = {
+			["Part0"] = "RootController",
+			["Part1"] = "LowerTorso",
+			C0 = CFrame.new(0, 1.975, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, -0.2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+		},
+		["LeftLegTarget"] = {
+			["Part0"] = "RootController",
+			["Part1"] = "LeftLegTarget",
+			C0 = CFrame.new(-0.5, 0.15, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+		},
+		["LeftLegRoot"] = {
+			["Part0"] = "LowerTorso",
+			["Part1"] = "LeftLegRoot",
+			C0 = CFrame.new(-0.5, -0.2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+		},
+
+		["RightLegTarget"] = {
+			["Part0"] = "RootController",
+			["Part1"] = "RightLegTarget",
+			C0 = CFrame.new(0.5, 0.15, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+		},
+		["RightLegRoot"] = {
+			["Part0"] = "LowerTorso",
+			["Part1"] = "RightLegRoot",
+			C0 = CFrame.new(0.5, -0.2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+		},
+		
+		["RootController"] = {
+			["Part0"] = "HumanoidRootPart",
+			["Part1"] = "RootController",
+			C0 = CFrame.new(0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+			C1 = CFrame.new(0, 2.975, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1),
+		}
+	}
+}
+
+return {
+	R6 = R6JointsData,
+	R15 = R15JointsData
+}

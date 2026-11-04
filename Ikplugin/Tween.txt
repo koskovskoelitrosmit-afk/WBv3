@@ -1,0 +1,120 @@
+const Easing = require(script:WaitForChild("Easing"))
+const runService = game:GetService("RunService")
+const Signal = require(script.Parent:WaitForChild("Signal"))
+
+export type TweenDetails = {
+	Time: number,
+	Style: string,
+	Direction: string,
+	Reverse: boolean
+}
+
+
+
+local function getLerpFunction(value: any)
+	local valueType = typeof(value)
+	if valueType == "number" then
+		return function(a, b, t)
+			return a + (b - a) * t
+		end
+	elseif valueType == "Vector3" or valueType == "Color3" or valueType == "Vector2" or valueType == "UDim2" then
+		return value.Lerp
+	end
+end
+
+
+local module = {}
+module.__index = module
+
+function module.new<T>(value: T, endValue: T, details: TweenDetails)
+	local self = setmetatable({}, module)
+	
+	self._startValue = value
+	self._endValue = endValue
+	
+	self._reverse = details.Reverse or false
+	
+	self._easingFunc = function(t)
+		return Easing.Calculate(details.Style or "Linear", {Direction = (details.Direction or "In")}, t)
+	end
+	self._lerpFunc = getLerpFunction(value)
+	if not self._lerpFunc then
+		warn("no lerp function for type: " .. typeof(value))
+	end
+	
+	self._time = details.Time
+	self._timeElapsed = 0
+	self._totalTime = self._reverse and self._time * 2 or self._time
+	
+	self._state = "idle"
+	self._connection = nil
+	
+	self.Tick = Signal.new()
+	self.Completed = Signal.new()
+	
+	return self
+end
+
+function module:Play()
+	if self._state == "playing" then
+		return
+	end
+	self._state = "playing"
+	self._timeElapsed = 0
+	
+	if self._time <= 0 then
+		self.Tick:Fire(self._endValue)
+		self._state = "completed"
+		self:Cancel() -- fires the completed signal
+		return
+	end
+	
+	self._connection = runService.Heartbeat:Connect(function(dt)
+		if self._timeElapsed >= self._totalTime or self._state == "idle" then
+			return
+		end
+		
+		self._timeElapsed = math.min(self._timeElapsed + dt, self._totalTime)
+		
+		local t = self._timeElapsed / self._time -- if reverse is true, t range is 0 to 2
+		t = 1 - math.abs(t - 1) -- when reverse is true, t will go from 0 to 1 and then back to 0
+		
+		t = self._easingFunc(t)
+		
+		local newValue = self._lerpFunc(self._startValue, self._endValue, t)
+		self.Tick:Fire(newValue)
+		
+		if self._timeElapsed >= self._totalTime then
+			self._state = "completed"
+			self:Cancel()
+			return
+		end
+	end)
+	
+end
+
+function module:Cancel()
+	if self._state == "idle" then
+		return
+	end
+	
+	self.Completed:Fire(self._state == "playing")
+	self._state = "idle"
+	
+	if self._connection then
+		self._connection:Disconnect()
+		self._connection = nil
+	end
+end
+
+function module:Destroy()
+	if self._connection then
+		self._connection:Disconnect()
+	end
+	self.Tick:DisconnectAll()
+	self.Completed:DisconnectAll()
+	setmetatable(self, nil)
+	for k in self do self[k] = nil end
+end
+
+return module

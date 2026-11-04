@@ -1,0 +1,49 @@
+const SelectionService = game:GetService("Selection")
+const RigUtils = require(script.Parent.Rig)
+
+local module = {}
+
+module.SelectionChanged = SelectionService.SelectionChanged
+
+function module.Get()
+	return SelectionService:Get()
+end
+
+function module.GetFirst()
+	return SelectionService:Get()[1]
+end
+
+function module.Add(item: Instance)
+	SelectionService:Add(item)
+end
+
+function module.Remove(item: Instance)
+	SelectionService:Remove(item)
+end
+
+function module.Set(items: {Instance})
+	SelectionService:Set(items)
+end
+
+function module.Clear()
+	SelectionService:Set({})
+end
+
+function module.GetSelectedRigs()
+	local rigs = {
+		IK = {},
+		Other = {}
+	}
+	for _, item in SelectionService:Get() do
+		if not RigUtils.ValidateRig(item) then continue end
+		
+		if RigUtils.ValidateRigWithIK(item) then
+			table.insert(rigs.IK, item)
+		else
+			table.insert(rigs.Other, item)
+		end
+	end
+	return rigs
+end
+
+return module

@@ -1,0 +1,16 @@
+
+
+
+local module = {}
+
+function module.new(Dragger: GuiObject, Dragged: GuiObject)
+	local detector = require(script.DragDetector).new(Dragger)
+	
+	detector.Dragged:Connect(function(delta)
+		Dragged.Position += UDim2.fromOffset(delta.X, delta.Y)
+	end)
+	
+	return detector
+end
+
+return module

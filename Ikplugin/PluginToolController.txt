@@ -1,0 +1,116 @@
+
+
+type ToolInfo = {
+	Name: string?,
+	Description: string?,
+	Icon: string?
+}
+
+
+type PluginToolController = {
+	BindToolButton: (self: PluginToolController, obj: any, v: (obj: any) -> boolean?) -> (),
+	AddItem: (self: PluginToolController, item: any) -> any,
+	RegisterUpdater: (self: PluginToolController, signal: RBXScriptSignal, updater: (...any) -> any?) -> (),
+	RegisterEvent: (self: PluginToolController, event: RBXScriptSignal, callback: (...any) -> any?) -> (),
+	Unregister: (self: PluginToolController, item: any) -> (),
+	Unload: (self: PluginToolController) -> (),
+}
+
+
+
+
+const CleanUpClass = require(script.Parent.CleanUp)
+
+local module = {}
+module.__index = module
+
+function module.new(pluginToolbar, ToolInfo: ToolInfo) : PluginToolController
+	local self = setmetatable({}, module)
+	
+	self._pluginToolbar = pluginToolbar
+	self._toolButton = pluginToolbar:CreateButton(ToolInfo.Name or "", ToolInfo.Description or "", ToolInfo.Icon or "")
+	
+	self._items = CleanUpClass.new()
+	self._references = {}
+	self._unloadBounds = {}
+	
+	return self
+end
+
+function module:BindToolButton(v: () -> boolean?, updater: boolean?)
+	
+	local function Update(...)
+		local active = v(...)
+		if typeof(active) == "boolean" then
+			self._toolButton:SetActive(active)
+		end
+	end
+	
+	if updater then
+		return self:RegisterUpdater(self._toolButton.Click, Update)
+	else
+		return self:RegisterEvent(self._toolButton.Click, Update)
+	end
+end
+
+function module:UpdateToolButton(active: boolean)
+	self._toolButton:SetActive(active)
+end
+
+function module:AddItem(item: any)
+	return self._items:Add(item)
+end
+
+function module:RegisterUpdater(signal, updater: (...any) -> any?)
+	updater(true)
+	return self._items:Connect(signal, updater)
+end
+
+function module:RegisterEvent(event, callback: (...any) -> any?)
+	return self._items:Connect(event, callback)
+end
+
+function module:Unregister(item)
+	self._items:Remove(item)
+end
+
+function module:CreateStorage()
+	return self._items:Extend()
+end
+
+function module:SetReference(id: string | {[string]: any?}, obj: any?)
+	if type(id) == "string" then
+		self._references[id] = obj
+		return self._references[id]
+	end
+	
+	if typeof(id) == "table" then
+		for key, value in id do
+			self._references[key] = value
+		end
+	end
+end
+
+function module:GetReference(id: string)
+	return self._references[id]
+end
+
+function module:BindToUnload(func: () -> ())
+	if typeof(func) == "function" and not table.find(self._unloadBounds, func) then
+		table.insert(self._unloadBounds, func)
+	end
+end
+
+function module:Unload()
+	for _, func in self._unloadBounds do
+		func()
+	end
+	self._items:CleanUp()
+	self._items = nil
+	self._references = nil
+	self._unloadBounds = nil
+end
+
+return {
+	new = module.new
+}

@@ -1,0 +1,118 @@
+local module = {}
+
+function module.Constant(t)
+	return math.floor(t)
+end
+
+function module.Linear(t)
+	return t
+end
+
+function module.Sine(t)
+	return 1 - math.cos(t * math.pi/2)
+end
+
+function module.Quad(t)
+	return t^2
+end
+
+function module.Cubic(t)
+	return t^3
+end
+module.CubicV2 = module.Cubic
+
+function module.Quart(t)
+	return t^4
+end
+
+function module.Quint(t)
+	return t^5
+end
+
+function module.Sextic(t)
+	return t^6
+end
+
+function module.Expo(t)
+	return t == 0 and 0 or 2^(10 * (t - 1))
+end
+
+function module.Circ(t)
+	return 1 - math.sqrt(1 - t^2)
+end
+module.Circular = module.Circ
+
+function module.Back(t, params)
+	local c = params.Overshoot or 1.70158
+	return (c + 1) * t^3 - c*t^2
+end
+
+function module.Elastic(t, params)
+	local period = params.period or 0.3
+	local amplitude = params.amplitude or 1
+	local s = 0
+
+	-- Amplitude must be at least 1 for the math to work correctly
+	if amplitude < 1 then
+		amplitude = 1 
+		s = period / 4
+	else
+		-- FIXED: 1 / amplitude instead of 2 * amplitude
+		s = period / (2 * math.pi) * math.asin(1 / amplitude)
+	end
+
+	return amplitude * -2^(10 * (t - 1)) * math.sin((2*math.pi * (t - 1 - s))/period)
+end
+
+function module.Bounce(t)
+	t = 1 - t
+	local val
+	if t < 1/2.75 then
+		val = 7.5625 * t^2
+	elseif t < 2/2.75 then
+		val = 7.5625 * (t - 1.5/2.75)^2 + 0.75
+	elseif t < 2.5/2.75 then
+		val = 7.5625 * (t - 2.25/2.75)^2 + 0.9375
+	else
+		val = 7.5625 * (t - 2.625/2.75)^2 + 0.984375
+	end
+	return 1 - val
+end
+
+------------ Directions
+
+function module.In(style, t, params)
+	return style(t, params)
+end
+
+function module.Out(style, t, params)
+	return 1 - style(1 - t, params)
+end
+
+function module.InOut(style, t, params)
+	if t < 0.5 then
+		return style(2 * t, params)/2
+	end
+	return 1 - style(-2*t + 2, params)/2
+end
+
+function module.OutIn(style, t, params)
+	if t < 0.5 then
+		return (1 - style(1 - 2*t, params))/2
+	end
+	return (1 + style(2 * t - 1, params))/2
+end
+
+------------ Calculate
+
+function module.Calculate(style, params, t)
+	local styleFunc = module[style]
+	assert(styleFunc, "Invalid easing style: " .. style)
+	
+	local directionFunc = module[params.Direction]
+	assert(directionFunc, `Invalid easing direction: {params.Direction}`)
+	
+	return directionFunc(styleFunc, t, params)
+end
+
+return module

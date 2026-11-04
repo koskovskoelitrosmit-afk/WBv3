@@ -1,0 +1,39 @@
+return {
+	["InsertR6"] = {
+		HoverModifiers = {
+			Brightness = 0.8
+		},
+		DownModifiers = {
+			Brightness = 0.6
+		}
+	},
+	["InsertR15"] = {
+		HoverModifiers = {
+			Brightness = 0.8
+		},
+		DownModifiers = {
+			Brightness = 0.6
+		}
+	},
+	["ConvertButton"] = {
+		HoverModifiers = {
+			Brightness = 0.8
+		},
+		DownModifiers = {
+			Brightness = 0.6
+		}
+	},
+	
+	["WinClose"] = {
+		HoverModifiers = {
+			Size = 0.95
+		},
+		DownModifiers = {
+			Size = 0.95
+		}
+	},
+	
+	["SelectAllbtn"] = {
+		_Type = "Checkbox"
+	}
+}

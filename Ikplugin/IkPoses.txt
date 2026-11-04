@@ -1,0 +1,302 @@
+
+const IkCalc = require(script.Parent:WaitForChild("IkCalc"))
+const RigUtils = require(script.Parent:WaitForChild("Rig"))
+
+--[[ 
+	this is how the limb cframe is calculated:
+		joint.P1.CF = joint.P0.CF * joint.C0 * poseCf * joint.C1:Inverse()
+		
+	solving for poseCf gives:
+		poseCf = (joint.P0.CF * jointC0):ToObjectSpace(joint.P1.CF * joint.C1)
+]]
+
+local module = {}
+
+
+---------------------------------------
+-- some utils
+local function RecursiveSearch(parent, childName, childType)
+	for _, child in parent:GetChildren() do
+		if child:IsA(childType) and child.Name == childName then
+			return child
+		else
+			local result = RecursiveSearch(child, childName, childType)
+			if result then
+				return result
+			end
+		end
+	end
+end
+---------------------------------------
+
+function module.BuildRigCache(IKRig, RigType)
+	local function findJoint(name)
+		return RecursiveSearch(IKRig, name, "Motor6D")
+	end
+
+	if RigType == "R6" then
+		local ikJoints = RigUtils.GetIkJointsR6(IKRig)
+		return {
+			rootControlJoint = findJoint("RootController"),
+			rootJoint = findJoint("RootJoint"),
+			leftRootJoint = findJoint("LeftLegRoot"),
+			leftTargetJoint = findJoint("LeftLegTarget"),
+			rightRootJoint = findJoint("RightLegRoot"),
+			rightTargetJoint = findJoint("RightLegTarget"),
+			LeftHip = ikJoints["Left Hip"],
+			RightHip = ikJoints["Right Hip"],
+			
+			LeftLength = IKRig["Left Leg"].Size.Y,
+			RightLength = IKRig["Right Leg"].Size.Y,
+			
+			VirtualRoot = {
+				C0 = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+				C1 = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0)
+			}
+		}
+	else
+		local leftTargetJoint = findJoint("LeftLegTarget")
+		local rightTargetJoint = findJoint("RightLegTarget")
+		
+		local lJoints, rJoints = RigUtils.GetIkJointsR15(IKRig, true)
+		local rigScale = RigUtils.GetR15RigScale(IKRig)
+		local RightLength, LeftLength = RigUtils.CalcLegLengthR15(IKRig)
+		
+		return {
+			rootJoint = findJoint("Root"),
+			rootControlJoint = findJoint("RootController"),
+			leftRootJoint = findJoint("LeftLegRoot"),
+			leftTargetJoint = leftTargetJoint,
+			rightRootJoint = findJoint("RightLegRoot"),
+			rightTargetJoint = rightTargetJoint,
+			leftTargetPartHalfY = leftTargetJoint.Part1.Size.Y / 2,
+			rightTargetPartHalfY = rightTargetJoint.Part1.Size.Y / 2,
+			
+			RightJoints = rJoints,
+			LeftJoints = lJoints,
+			RightLength = RightLength,
+			LeftLength = LeftLength,
+			
+			VirtualRoot = {
+				C0 = CFrame.new(0, -rigScale.Y, 0),
+				C1 = CFrame.new(0, -0.2 * rigScale.Y, 0)
+			}
+		}
+	end
+end
+
+
+function module.BakePoses_R6(Keyframe: Keyframe, IKRig: Model, RigCache)
+	local function GetPose(name) : Pose
+		return RecursiveSearch(Keyframe, name, "Pose") or {CFrame = CFrame.new()}
+	end
+	
+	
+	local rigPose = GetPose("HumanoidRootPart")
+	if not rigPose then
+		error("Missing HumanoidRootPart Pose.")
+		return
+	end
+	
+	local rootControlPose = GetPose("RootController")
+	
+	local TorsoPose = GetPose("Torso")
+	if typeof(TorsoPose) == "table" then
+		TorsoPose = Instance.new("Pose")
+		TorsoPose.Name = "Torso"
+		TorsoPose.Parent = rigPose
+	end
+
+	local RightRootPose = GetPose("RightLegRoot")
+	local RightTargetPose = GetPose("RightLegTarget")
+
+	local LeftRootPose = GetPose("LeftLegRoot")
+	local LeftTargetPose = GetPose("LeftLegTarget")
+
+	------------------------------------------------------------------------
+	
+	local virtualRoot = RigCache.VirtualRoot
+	
+	local rootJoint = RigCache.rootJoint
+	local rootControlJoint = RigCache.rootControlJoint
+	local leftRootJoint = RigCache.leftRootJoint
+	local leftTargetJoint = RigCache.leftTargetJoint
+	local rightRootJoint = RigCache.rightRootJoint
+	local rightTargetJoint = RigCache.rightTargetJoint
+	local LeftHip = RigCache.LeftHip
+	local RightHip = RigCache.RightHip
+	local LeftLegLength = RigCache.LeftLength
+	local RightLegLength = RigCache.RightLength
+	
+	------------------------------------------------------------------------
+	
+	local function CalcIKPoseCFrame(ikRootPose, ikTargetPose, ikRootJoint, ikTargetJoint, Hip, LegLength)
+		local rootCF
+		if rootControlJoint then
+			rootCF = rootControlJoint.Part0.CFrame * rootControlJoint.C0 * rootControlPose.CFrame * rootControlJoint.C1:Inverse()
+		else
+			rootCF = rootJoint.Part0.CFrame
+		end
+		
+		local torsoCF = rootCF * rootJoint.C0 * TorsoPose.CFrame * rootJoint.C1:Inverse()
+		
+		local LegRootCF = torsoCF * ikRootJoint.C0 * ikRootPose.CFrame * ikRootJoint.C1:Inverse()
+		local LegTargetCF = rootCF * (ikTargetJoint.C0 * CFrame.new(0, -ikTargetJoint.Part1.Size.Y/2, 0))
+			* ikTargetPose.CFrame * ikTargetJoint.C1:Inverse()
+		
+		local IKCF = IkCalc.CalcR6(LegRootCF, LegTargetCF, LegLength)
+		local PoseCF = (torsoCF * Hip.C0):ToObjectSpace(IKCF * Hip.C1)
+		return PoseCF
+	end
+
+	------------------------------------------------------------------------
+	
+	local LeftLegPose = Instance.new("Pose")
+	LeftLegPose.Name = "Left Leg"
+	LeftLegPose.CFrame = CalcIKPoseCFrame(LeftRootPose, LeftTargetPose, leftRootJoint, leftTargetJoint, LeftHip, LeftLegLength)
+
+	local RightLegPose = Instance.new("Pose")
+	RightLegPose.Name = "Right Leg"
+	RightLegPose.CFrame = CalcIKPoseCFrame(RightRootPose, RightTargetPose, rightRootJoint, rightTargetJoint, RightHip, RightLegLength)
+
+	LeftLegPose.Parent = TorsoPose
+	RightLegPose.Parent = TorsoPose
+	
+	
+	--- update torso pose (calc torso cf + offset from controller and apply relative to regular rootjoint)
+	if rootControlJoint then
+		local rootControllerCF = rootControlJoint.Part0.CFrame * rootControlJoint.C0 * rootControlPose.CFrame * rootControlJoint.C1:Inverse()
+		local newTorsoCFrame = rootControllerCF * rootJoint.C0 * TorsoPose.CFrame * rootJoint.C1:Inverse()
+		local newTorsoPoseCF = (rootControlJoint.Part0.CFrame * virtualRoot.C0):ToObjectSpace(newTorsoCFrame * virtualRoot.C1)
+		TorsoPose.CFrame = newTorsoPoseCF
+	end
+	
+	
+	if typeof(rootControlPose) == "Instance" then
+		for _, p in rootControlPose:GetSubPoses() do
+			p.Parent = rigPose
+		end
+	end
+	
+	if typeof(rootControlPose) == "Instance" then rootControlPose:Destroy() end
+	if typeof(LeftRootPose) == "Instance" then LeftRootPose:Destroy() end
+	if typeof(LeftTargetPose) == "Instance" then LeftTargetPose:Destroy() end
+	if typeof(RightRootPose) == "Instance" then RightRootPose:Destroy() end
+	if typeof(RightTargetPose) == "Instance" then RightTargetPose:Destroy() end
+end
+
+
+function module.BakePoses_R15(Keyframe: Keyframe, IKRig: Model, RigCache)
+	local function GetPose(name)
+		return RecursiveSearch(Keyframe, name, "Pose") or {CFrame = CFrame.new()}
+	end
+
+	local rigPose = GetPose(IKRig.PrimaryPart.Name)
+	
+	local rootControlPose = GetPose("RootController")
+	
+	local LowerTorsoPose = GetPose("LowerTorso")
+	if typeof(LowerTorsoPose) == "table" then
+		LowerTorsoPose = Instance.new("Pose")
+		LowerTorsoPose.Name = "LowerTorso"
+		LowerTorsoPose.Parent = rigPose
+	end
+
+	local RightRootPose = GetPose("RightLegRoot")
+	local RightTargetPose = GetPose("RightLegTarget")
+
+	local LeftRootPose = GetPose("LeftLegRoot")
+	local LeftTargetPose = GetPose("LeftLegTarget")
+
+	------------------------------------------------------------------------
+
+	local rootJoint = RigCache.rootJoint
+	local rootControlJoint = RigCache.rootControlJoint
+	local leftRootJoint = RigCache.leftRootJoint
+	local leftTargetJoint = RigCache.leftTargetJoint
+	local rightRootJoint = RigCache.rightRootJoint
+	local rightTargetJoint = RigCache.rightTargetJoint
+	local leftTargetPartHalfY = RigCache.leftTargetPartHalfY
+	local rightTargetPartHalfY = RigCache.rightTargetPartHalfY
+	
+	local rightLength = RigCache.RightLength
+	local leftLength = RigCache.LeftLength
+	
+	local rightJoints = RigCache.RightJoints
+	local leftJoints = RigCache.LeftJoints
+	local virtualRoot = RigCache.VirtualRoot
+	
+	------------------------------------------------------------------------
+
+	local function CalcPoseCFrame(rootPose, targetPose, RootJoint, TargetJoint, legJoints, targetPartHalfY)
+		local rootCF
+		if rootControlJoint then
+			rootCF = rootControlJoint.Part0.CFrame * rootControlJoint.C0 * rootControlPose.CFrame * rootControlJoint.C1:Inverse()
+		else
+			rootCF = rootJoint.Part0.CFrame
+		end
+		
+		local l_torsoCF = rootJoint.Part0.CFrame * rootJoint.C0 * LowerTorsoPose.CFrame * rootJoint.C1:Inverse()
+
+		local RootCF = l_torsoCF * RootJoint.C0 * rootPose.CFrame * RootJoint.C1:Inverse()
+		local TargetCF = rootJoint.Part0.CFrame * TargetJoint.C0 * CFrame.new(0, -targetPartHalfY, 0) * targetPose.CFrame * TargetJoint.C1:Inverse()
+
+		local IkHipCf, IkLegCf, IkFootCf = IkCalc.CalcR15(RootCF, TargetCF, legJoints, rightLength.L1, rightLength.L2, rightLength.Foot)
+		
+		local HipPoseCF  = (l_torsoCF * legJoints.Hip.C0):ToObjectSpace(IkHipCf * legJoints.Hip.C1)
+		local LegPoseCF  = (IkHipCf * legJoints.Knee.C0):ToObjectSpace(IkLegCf * legJoints.Knee.C1)
+		local FootPoseCF = (IkLegCf * legJoints.Ankle.C0):ToObjectSpace(IkFootCf * legJoints.Ankle.C1)
+		
+		return HipPoseCF, LegPoseCF, FootPoseCF
+	end
+
+	------------------------------------------------------------------------
+
+	--- LEFT LEG
+	local LeftHipPose = Instance.new("Pose"); LeftHipPose.Name = "LeftUpperLeg"
+	local LeftKneePose = Instance.new("Pose"); LeftKneePose.Name = "LeftLowerLeg"
+	local LeftAnklePose = Instance.new("Pose"); LeftAnklePose.Name = "LeftFoot"
+	LeftAnklePose.Parent = LeftKneePose
+	LeftKneePose.Parent = LeftHipPose
+
+	LeftHipPose.CFrame, LeftKneePose.CFrame, LeftAnklePose.CFrame = CalcPoseCFrame(LeftRootPose, LeftTargetPose, leftRootJoint, leftTargetJoint, leftJoints, leftTargetPartHalfY)
+
+	--- RIGHT LEG
+	local RightHipPose = Instance.new("Pose"); RightHipPose.Name = "RightUpperLeg"
+	local RightKneePose = Instance.new("Pose"); RightKneePose.Name = "RightLowerLeg"
+	local RightAnklePose = Instance.new("Pose"); RightAnklePose.Name = "RightFoot"
+	RightAnklePose.Parent = RightKneePose
+	RightKneePose.Parent = RightHipPose
+
+	RightHipPose.CFrame, RightKneePose.CFrame, RightAnklePose.CFrame = CalcPoseCFrame(RightRootPose, RightTargetPose, rightRootJoint, rightTargetJoint, rightJoints, rightTargetPartHalfY)
+
+	LeftHipPose.Parent = LowerTorsoPose
+	RightHipPose.Parent = LowerTorsoPose
+	
+	--- update torso pose (calc torso cf + offset from controller and apply relative to regular rootjoint)
+	if rootControlJoint then
+		local rootControllerCF = rootControlJoint.Part0.CFrame * rootControlJoint.C0 * rootControlPose.CFrame * rootControlJoint.C1:Inverse()
+		local newLowerTorsoCFrame = rootControllerCF * rootJoint.C0 * LowerTorsoPose.CFrame * rootJoint.C1:Inverse()
+		local newLowerTorsoPoseCF = (rootControlJoint.Part0.CFrame * virtualRoot.C0):ToObjectSpace(newLowerTorsoCFrame * virtualRoot.C1)
+		LowerTorsoPose.CFrame = newLowerTorsoPoseCF
+	end
+
+
+	if typeof(rootControlPose) == "Instance" then
+		for _, p in rootControlPose:GetSubPoses() do
+			p.Parent = rigPose
+		end
+	end
+	
+	if typeof(rootControlPose) == "Instance" then rootControlPose:Destroy() end
+	if typeof(LeftRootPose) == "Instance" then LeftRootPose:Destroy() end
+	if typeof(LeftTargetPose) == "Instance" then LeftTargetPose:Destroy() end
+	if typeof(RightRootPose) == "Instance" then RightRootPose:Destroy() end
+	if typeof(RightTargetPose) == "Instance" then RightTargetPose:Destroy() end
+end
+
+
+
+
+
+return module

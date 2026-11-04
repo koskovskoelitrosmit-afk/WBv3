@@ -1,0 +1,79 @@
+local Connection = {}
+Connection.__index = Connection
+
+function Connection.new(signal, callback: (...any) -> (), Once: boolean)
+	local self = setmetatable({}, Connection)
+	self.callback = callback
+	self.connected = true
+	self.signal = signal
+	self.Once = (Once == true)
+	return self
+end
+
+function Connection:Disconnect()
+	self.connected = false
+	local connections = self.signal._connections
+	local index = table.find(connections, self)
+	if index then
+		table.remove(connections, index)
+	end
+end
+
+--------------------------------------
+
+local Signal = {}
+Signal.__index = Signal
+
+function Signal.new()
+	local self = setmetatable({}, Signal)
+	self._connections = {}
+	return self
+end
+
+function Signal:Fire(...)
+	for i = #self._connections, 1, -1 do
+		local connection = self._connections[i]
+		if connection.connected then
+			if connection.Once then connection:Disconnect() end
+			
+			if typeof(connection.callback) == "thread" and 
+				coroutine.status(connection.callback) ~= "suspended"
+			then
+				continue
+			end
+			
+			task.spawn(connection.callback, ...)
+		end
+	end
+end
+
+function Signal:DisconnectAll()
+	for i = #self._connections, 1, -1 do
+		local connection = self._connections[i]
+		if connection.connected then
+			connection:Disconnect()
+		end
+	end
+	self._connections = {}
+end
+
+function Signal:Connect(callback: (...any) -> ())
+	local connection = Connection.new(self, callback)
+	table.insert(self._connections, connection)
+	return connection
+end
+
+function Signal:Once(callback: (...any) -> ())
+	local connection = Connection.new(self, callback, true)
+	table.insert(self._connections, connection)
+	return connection
+end
+
+function Signal:Wait()
+	local currentThread = coroutine.running()
+	local connection = Connection.new(self, currentThread, true)
+	table.insert(self._connections, connection)
+	return coroutine.yield()
+end
+
+return Signal

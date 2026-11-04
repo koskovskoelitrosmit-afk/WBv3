@@ -1,0 +1,95 @@
+
+
+type Disconnectable = {Disconnect: (self: Disconnectable) -> ()} | {DiscnnectAll: (self: Disconnectable) -> ()}
+type Destroyable = Instance | {Destroy: (self: Destroyable) -> ()}
+type Signal = {Connect: (self: Signal, callback: (...any) -> ()) -> ()} | RBXScriptSignal
+
+type Trackable = RBXScriptConnection | thread | Disconnectable | Destroyable
+
+
+
+
+local function getCleanUpFunction(track: Trackable)
+	if typeof(track) == "Instance" then
+		return "Destroy"
+	elseif typeof(track) == "RBXScriptConnection" then
+		return "Disconnect"
+	elseif typeof(track) == "function" then
+		return track
+	elseif typeof(track) == "thread" then
+		return "thread"
+	elseif typeof(track) == "table" then
+		if typeof(track.Destroy) == "function" then
+			return "Destroy"
+		elseif typeof(track.DisconnectAll) == "function" then
+			return "DisconnectAll"
+		elseif typeof(track.Disconnect) == "function" then
+			return "Disconnect"
+		elseif typeof(track.CleanUp) == "function" then
+			return "CleanUp"
+		end
+	end
+end
+
+
+local module = {}
+module.__index = module
+
+function module.new()
+	return setmetatable({
+		_tracks = {} :: {Trackable}
+	}, module)
+end
+
+function module:Add(obj: Trackable)
+	if not obj then return end
+	
+	local cleanUpFunction = getCleanUpFunction(obj)
+	if not cleanUpFunction then return end
+	
+	table.insert(self._tracks, {obj, cleanUpFunction})
+	
+	return obj
+end
+
+function module:Connect(sig: Signal, callback: (...any) -> ())
+	return self:Add(sig:Connect(callback))
+end
+
+
+function module:Extend()
+	return self:Add(module.new())
+end
+
+
+function module:Remove(obj: string | Trackable)
+	if not obj then return end
+	
+	local tracks = self._tracks
+	local index = table.find(tracks, obj)
+	if index then
+		self:_cleanTrack(table.remove(tracks, index))
+	end
+end
+
+function module:CleanUp()
+	for _, track in self._tracks do
+		self:_cleanTrack(track)
+	end
+	self._tracks = {}
+end
+
+function module:_cleanTrack(track: Trackable)
+	local obj, method = track[1], track[2]
+	if obj then
+		if method == "thread" then
+			task.cancel(obj)
+		elseif obj == method then
+			obj()
+		else
+			obj[method](obj)
+		end
+	end
+end
+
+return module

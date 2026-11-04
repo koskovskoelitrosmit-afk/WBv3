@@ -1,0 +1,343 @@
+
+
+
+local global = shared._IKRigGlobal
+
+local ToolController = global.classes.PluginToolController.new(global.toolbar, {
+	Name = "Convert Animation",
+	Description = "Bake To Regular Rig Animation",
+	Icon = "rbxassetid://83856799245957"
+})
+
+
+--------------------------------
+---- Tool Button Setup
+
+local guiUtil = global.utils.Gui
+
+local cnvtFrame = guiUtil.GetFrame("ConvertFrame")
+ToolController:RegisterEvent(cnvtFrame.WinHeader.WinClose.MouseButton1Click, function()
+	guiUtil.GetFrame("ConvertFrame").Visible = false
+	ToolController:UpdateToolButton(false)
+end)
+
+-- drag :D
+global.classes.DraggableUI.new(cnvtFrame.WinHeader.DragArea, cnvtFrame)
+
+ToolController:BindToolButton(function(init)
+	if init then return guiUtil.GetFrame("ConvertFrame").Visible end
+	return guiUtil.ToggleFrame("ConvertFrame")
+end, true)
+
+-------------------------------
+---- CONFIGURATION
+
+local Selection = global.utils.Selection
+local RigUtils = global.utils.Rig
+
+local ConvertFrame = guiUtil.GetFrame("ConvertFrame")
+local ConvertConfig = ConvertFrame:WaitForChild("Config")
+local RigsConfig = ConvertConfig:WaitForChild("Rigs")
+
+local function UpdateRigsConfig()
+	local rigs = Selection.GetSelectedRigs()
+
+	local ikRig = rigs.IK[1]
+	local otherRig = rigs.Other[1]
+
+	if not RigsConfig:FindFirstChild("IK") or not RigsConfig:FindFirstChild("OtherRig") then
+		return
+	end
+
+	RigsConfig.IK.Text = ikRig and ikRig.Name or "Select IK Rig"
+	RigsConfig.OtherRig.Text = otherRig and otherRig.Name or "<Create New>"
+
+	RigsConfig.IK.TextColor3 = ikRig and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 190, 190)
+	RigsConfig.OtherRig.TextColor3 = otherRig and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 190, 190)
+
+	if ikRig and otherRig and RigUtils.GetRigType(ikRig) ~= RigUtils.GetRigType(otherRig) then
+		RigsConfig.OtherRig.TextColor3 = Color3.fromRGB(255, 71, 71)
+	end
+
+end
+
+
+---------------------------
+---- ANIMATIONS
+
+
+local CheckboxClass = global.classes.Checkbox
+
+local SelectAllBtn = guiUtil.GetButton("SelectAllbtn")
+local AnimationsConfig = ConvertConfig:WaitForChild("Animations")
+local AnimsOptionsList = AnimationsConfig:WaitForChild("List")
+local AnimOption = script:WaitForChild("animOption")
+
+
+local Checkboxes = ToolController:SetReference("Checkboxes", {})
+
+
+
+local function UpdateListSize()
+	local contentSize = AnimsOptionsList.UIListLayout.AbsoluteContentSize.Y
+	local frameSize = math.clamp(contentSize, 0, 25 * 6) -- 6 is the max amount of options to show
+
+	AnimsOptionsList.CanvasSize = UDim2.fromOffset(0, contentSize)
+	AnimsOptionsList.Size = UDim2.new(1, 0, 0, frameSize)
+
+	ConvertConfig.Animations.Size = UDim2.new(1, 0, 0, 25 + 10 + frameSize)
+
+	ConvertFrame.Size = UDim2.new(0, 250, 0, 10 + ConvertConfig.UIListLayout.AbsoluteContentSize.Y + 10 + 22 + 10 + 32)
+end
+
+
+local function ExtractAnimations(rig: Model) : {KeyframeSequence | CurveAnimation}
+	if not rig then return {} end
+
+	local animations = {}
+	local saves = rig:FindFirstChild("AnimSaves")
+	
+	if saves then
+		local function insert(anim)
+			if anim:IsA("KeyframeSequence") or anim:IsA("CurveAnimation") then 
+				table.insert(animations, anim)
+			end
+		end
+		
+		for _, anim in saves:GetChildren() do
+			insert(anim)
+		end
+
+		if saves:IsA("ObjectValue") and saves.Value then
+			for _, anim in saves.Value:GetChildren() do
+				insert(anim)
+			end
+		end
+	end
+
+	return animations
+end
+
+local function UpdateAnimationsConfig()
+	local currentIkRig = ToolController:GetReference("IkRig")
+	local newIkRig = Selection.GetSelectedRigs().IK[1]
+	if newIkRig == currentIkRig and currentIkRig ~= nil then return end
+
+	ToolController:SetReference("IkRig", newIkRig)
+
+	----------------------------------------------------
+	-- Find and Store Animations
+	local ExtractedAnimations = ExtractAnimations(newIkRig)
+
+	----------------------------------------------------
+	-- Replace Options
+
+	SelectAllBtn:SetChecked(false)
+
+	for _, option in AnimsOptionsList:GetChildren() do
+		if option:IsA("Frame") then
+			option:Destroy()
+		end
+	end
+	ToolController:SetReference("Checkboxes", {})
+
+	if #ExtractedAnimations == 0 then
+		AnimsOptionsList.NoAnimsLabel.Visible = true
+		UpdateListSize()
+		return
+	end
+
+	AnimsOptionsList.NoAnimsLabel.Visible = false
+
+	for _, anim in ExtractedAnimations do
+		local option = AnimOption:Clone()
+		option.label.Text = anim.Name
+		option.Parent = AnimsOptionsList
+
+		local checkbox = CheckboxClass.new(option.checkbox)
+		local Unbind = SelectAllBtn:BindCheckbox(checkbox)
+		checkbox.Button.Destroying:Once(function()
+			Unbind()
+		end)
+
+		ToolController:GetReference("Checkboxes")[anim] = checkbox
+	end
+	UpdateListSize()
+
+end
+
+
+local function UpdateConfigFrame()
+	UpdateRigsConfig()
+	UpdateAnimationsConfig()
+end
+
+
+ToolController:RegisterUpdater(Selection.SelectionChanged, UpdateConfigFrame)
+
+--------------------------------------------
+--- Convertion
+
+local Colors = {
+	Success = Color3.fromRGB(73, 191, 92),
+	Error = Color3.fromRGB(184, 51, 51),
+	Default = Color3.fromRGB(89, 155, 255)
+}
+local state = global.state
+
+local AnimConverter = global.utils.AnimConverter
+local RigGenerator = global.utils.RigGenerator
+
+local convertBtn = guiUtil.GetButton("ConvertButton")
+
+------------------------------------------------------------
+--- Some convertion utilities
+
+local function GetCheckedAnims()
+	local anims = {}
+	for anim, checkbox in ToolController:GetReference("Checkboxes") do
+		if anim and checkbox:IsChecked() and not table.find(anims, anim) then
+			table.insert(anims, anim)
+		end
+	end
+	return anims
+end
+
+
+local function ConvertAnimations(anims: {KeyframeSequence | CurveAnimation}, rig: Model)
+	local converted = {}
+	for _, anim in anims do
+		local result
+		if anim:IsA("KeyframeSequence") then
+			result = AnimConverter.Convert(anim, rig)
+		elseif anim:IsA("CurveAnimation") then
+			result = AnimConverter.ConvertCurve(anim, rig)
+		end
+		if result then
+			table.insert(converted, result)
+		end
+	end
+	return converted
+end
+
+
+local function SaveAnims(anims: {KeyframeSequence | CurveAnimation}, parentRig: Model)
+	local animsaves = parentRig:FindFirstChild("AnimSaves")
+	if not animsaves then
+		animsaves = Instance.new("Model")
+		animsaves.Name = "AnimSaves"
+		animsaves.Parent = parentRig
+	end
+
+	for _, anim in anims do
+		anim.Parent = animsaves
+	end
+end
+
+------------------------------------------------------------
+
+--- Main Convertion Function
+local function onConvertClicked()
+	if state.processing then return end
+	state.processing = true
+
+	local selectedRigs = Selection.GetSelectedRigs()
+	local ikRig = selectedRigs.IK[1]
+	local parentRig = selectedRigs.Other[1]
+
+	--- Check if parent rig is of same type as ik rig
+	local _RigType = RigUtils.GetRigType(ikRig)
+	if parentRig and RigUtils.GetRigType(parentRig) ~= _RigType then
+		state.processing = false
+		return
+	end
+
+	--- Get Selected Anims to Convert
+	local animsToConvert = GetCheckedAnims()
+	if #animsToConvert == 0 then state.processing = false; return end
+
+	--- Start Converting
+	local twnDetails = {Time = 0.125}
+	convertBtn:SetContent("Processing...", twnDetails)
+
+	local convertedAnims = nil
+	local success, result = pcall(function()
+		convertedAnims = ConvertAnimations(animsToConvert, ikRig)
+	end)
+	
+	if not success then
+		global.classes.Logger.Warn(`Failed to convert animations: {result}`)
+	else
+		--- Save Anims
+		
+		success, result = pcall(function()
+			if not parentRig then
+				parentRig = RigGenerator.CreateRegularRigCopy(ikRig)
+				parentRig.Name = "[Converted] " .. ikRig.Name
+				if parentRig and parentRig:FindFirstChild("AnimSaves") then
+					parentRig.AnimSaves:Destroy()
+				end
+				RigGenerator.PlaceRig(parentRig, workspace)
+				Selection.Set({parentRig})
+			end
+
+			SaveAnims(convertedAnims, parentRig)
+		end)
+		
+		if not success then
+			global.classes.Logger.Warn(`Failed to save converted animations: {result}`)
+		end
+	end
+
+	task.delay(2, function()
+		state.processing = false
+	end)
+
+	--------------------------------------------
+	--- Update UI
+
+	local color = success and Colors.Success or Colors.Error
+	local text = success and "Success!" or "Error"
+
+	local twn = convertBtn:Tween({BgColor = color}, twnDetails)
+
+	twn.Get("BgColor").Completed:Once(function(interrupted)
+		if interrupted then return end
+
+		task.wait(1.5)
+
+		convertBtn:Tween({BgColor = Colors.Default}, twnDetails).Play()
+		convertBtn:SetContent("Convert", twnDetails)
+	end)
+
+	convertBtn:SetContent(text, twnDetails)
+	twn.Play()
+end
+
+ToolController:RegisterEvent(convertBtn.Click, onConvertClicked)
+
+
+
+
+ToolController:BindToUnload(function()
+	global = nil
+	ToolController = nil
+	guiUtil = nil
+	Selection = nil
+	RigUtils = nil
+	ConvertFrame = nil
+	ConvertConfig = nil
+	RigsConfig = nil
+	CheckboxClass = nil
+	SelectAllBtn = nil
+	AnimationsConfig = nil
+	AnimsOptionsList = nil
+	AnimOption = nil
+	Colors = nil
+	state = nil
+	AnimConverter = nil
+	RigGenerator = nil
+	convertBtn = nil
+end)
+
+return ToolController

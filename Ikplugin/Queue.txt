@@ -1,0 +1,28 @@
+local module = {}
+module.__index = module
+
+function module.new()
+	return setmetatable({_queue = {}}, module)
+end
+
+function module:Enqueue(item)
+	self._queue[#self._queue + 1] = item
+end
+
+function module:Dequeue()
+	return table.remove(self._queue, 1)
+end
+
+function module:IsEmpty()
+	return #self._queue == 0
+end
+
+function module:Peek()
+	return self._queue[1]
+end
+
+function module:Count()
+	return #self._queue
+end
+
+return module

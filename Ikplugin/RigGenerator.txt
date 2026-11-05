@@ -1,3 +1,4 @@
+
 const Rigs = script.Parent.Parent.Rigs
 const RigUtils = require(script.Parent:WaitForChild("Rig"))
 const JointsData = require(script:WaitForChild("JointsData"))
@@ -14,6 +15,7 @@ const Logger = shared._IKRigGlobal.classes.Logger
 local IK_Controls = script.Parent.Parent["IK-Controls"]
 
 local Load_WorldModel = script.RigLoadWorld
+local BoneLegAdapter = script.Parent:WaitForChild("BoneLegAdapter")
 
 local module = {}
 
@@ -44,7 +46,53 @@ local function RemoveIkOnlyJoints(rig: Model, rigType: "R6" | "R15")
 		end
 	end
 end
+local function AddBoneControlJoints(rig: Model, jointsCFrames)
+	local jointsData = JointsData.R6.IK
+	local allowed = {
+		RootController = true,
+		LeftLegTarget = true,
+		RightLegTarget = true,
+		LeftLegRoot = true,
+		RightLegRoot = true,
+	}
 
+	for name, data in jointsData do
+		if allowed[name] ~= true then
+			continue
+		end
+
+		local part0 = FindPartInModel(rig, data.Part0)
+		local part1 = FindPartInModel(rig, data.Part1)
+		if not part0 or not part1 then
+			continue
+		end
+
+		local newJoint = Instance.new("Motor6D")
+		newJoint.Name = name
+
+		local frames = jointsCFrames and jointsCFrames[name]
+		newJoint.C0 = frames and frames.C0 or data.C0
+		newJoint.C1 = frames and frames.C1 or data.C1
+		newJoint.Part0 = part0
+		newJoint.Part1 = part1
+		newJoint.Parent = part0
+	end
+end
+
+local function RemoveBoneControlJoints(rig: Model)
+	local names = {
+		RootController = true,
+		LeftLegTarget = true,
+		RightLegTarget = true,
+		LeftLegRoot = true,
+		RightLegRoot = true,
+	}
+	for _, joint in rig:GetDescendants() do
+		if joint:IsA("Motor6D") and names[joint.Name] == true then
+			joint.Parent = nil
+		end
+	end
+end
 local function AddIkOnlyJoints(rig: Model, rigType: "R6" | "R15", jointsCFrames: {[string]: CFrame})
 	local jointsData = JointsData[rigType].IK
 	
@@ -227,19 +275,33 @@ end
 
 function module.IkifyRig(rig: Model)
 	local rigType = RigUtils.GetRigType(rig)
-	if not rigType then warn("Invalid Plugin Type 0") return false end
-	
-	if not (rig:FindFirstAncestorOfClass("Workspace") or rig:FindFirstAncestorOfClass("WorldModel")) then
+	if not rigType then
+		warn("Invalid Plugin Type 0")
+		return false
+	end
+
+	local boneRig = RigUtils.IsBoneRig(rig)
+	if boneRig then
+		local meta = BoneLegAdapter.Bind(rig)
+		if not meta.Enabled then
+			Logger.Warn("BoneLegAdapter: no thigh/knee chain found on " .. rig.Name)
+			return false
+		end
+	end
+
+	if not (rig:FindFirstAncestorOfClass("Workspace")
+		or rig:FindFirstAncestorOfClass("WorldModel")) then
 		Logger.Warn("Rig must be inside workspace to be ikified")
 		return false
 	end
-	
+
 	HistoryService:SetWaypoint("IKRigPlugin/PreIKifyRig")
-	
 	rig:PivotTo(rig:GetPivot())
-	
+
 	local jointsCFrames = nil
-	if rigType == "R15" then
+	if boneRig then
+		jointsCFrames = RigUtils.CalcR6IkControlsCframes(rig)
+	elseif rigType == "R15" then
 		ReplaceNewR15Constraints(rig)
 		RigUtils.CreateIkAttachments(rig)
 		jointsCFrames = RigUtils.CalcR15IkControlsCframes(rig)
@@ -247,38 +309,60 @@ function module.IkifyRig(rig: Model)
 		RigUtils.CreateIkAttachments(rig)
 		jointsCFrames = RigUtils.CalcR6IkControlsCframes(rig)
 	end
-	
+
 	InitializeIK(rig)
-	RemoveRegularOnlyJoints(rig, rigType)
-	AddIkOnlyJoints(rig, rigType, jointsCFrames)
-	
+
+	if boneRig then
+		-- Keep the regular RootJoint and both hip Motor6Ds exactly as authored.
+		AddBoneControlJoints(rig, jointsCFrames)
+	else
+		RemoveRegularOnlyJoints(rig, rigType)
+		AddIkOnlyJoints(rig, rigType, jointsCFrames)
+	end
+
 	rig:PivotTo(rig:GetPivot())
-	
 	HistoryService:SetWaypoint("IKRigPlugin/IKifyRig")
-	
+
+	if boneRig then
+		BoneLegAdapter.PrintReport(rig)
+	end
+
 	return true
 end
 
 
-
 function module.DeIkifyRig(rig: Model)
 	local rigType = RigUtils.GetRigType(rig)
-	if not rigType then return end
-	
+	if not rigType then
+		return
+	end
+
+	local boneRig = RigUtils.IsBoneRig(rig)
+		or rig:GetAttribute(BoneLegAdapter.Attribute) == true
+
+	if boneRig then
+		BoneLegAdapter.Restore(rig)
+		rig:RemoveTag(IK_RIG_TAG)
+		RemoveBoneControlJoints(rig)
+		RigUtils.RemoveIKControls(rig)
+		RigUtils.RemoveIkAttachments(rig)
+		BoneLegAdapter.Unbind(rig)
+		return
+	end
+
 	local jointsCFrames = nil
 	if rigType == "R15" then
 		jointsCFrames = RigUtils.GetIkJointsR15(rig)
 	else
 		jointsCFrames = RigUtils.GetIkJointsR6(rig)
 	end
-	
+
 	rig:RemoveTag(IK_RIG_TAG)
 	RigUtils.RemoveIKControls(rig)
 	RigUtils.RemoveIkAttachments(rig)
 	RemoveIkOnlyJoints(rig, rigType)
 	AddRegularOnlyJoints(rig, rigType, jointsCFrames)
 end
-
 
 
 

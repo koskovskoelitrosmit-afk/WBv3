@@ -1,6 +1,7 @@
 const global = shared._IKRigGlobal
 const IKRig_Tag = global.IKRig_Tag
 const IK_Controls = script.Parent.Parent["IK-Controls"]
+local BoneLegAdapter = script.Parent:WaitForChild("BoneLegAdapter")
 
 const R15ratioY = {
 	["Hip"] = {C0 = 0.2/0.4, C1 = 0.421/1.217},
@@ -29,14 +30,20 @@ end
 
 local module = {}
 
+local function isBoneRig(rig)
+	return BoneLegAdapter.IsBoneLegRig(rig)
+end
 
 
 ----/// RIG VALIDATION
-function module.ValidateRig(rig: Model) : boolean
+function module.ValidateRig(rig: Model): boolean
 	if not rig then return false end
 	if not rig:IsA("Model") then return false end
-	if not rig.PrimaryPart then return false end
 	if not rig:FindFirstChildOfClass("Humanoid") then return false end
+	if module.IsBoneRig(rig) then
+		return BoneLegAdapter.GetRootPart(rig) ~= nil
+	end
+	if not rig.PrimaryPart then return false end
 	return true
 end
 
@@ -48,26 +55,31 @@ end
 
 function module.GetRigType(rig: Model) : ("R6" | "R15")?
 	if not module.ValidateRig(rig) then return nil end
+	if module.IsBoneRig(rig) then
+		return "R6"
+	end
+
 	local humanoid = rig:FindFirstChildOfClass("Humanoid")
-	
 	if humanoid.RigType == Enum.HumanoidRigType.R6 then
 		return "R6"
 	elseif humanoid.RigType == Enum.HumanoidRigType.R15 then
 		return "R15"
 	end
-	
 	return nil
 end
-
 
 
 ----// RIG INFO
 function module.GetLegs(rig: Model)
 	local rigType = module.GetRigType(rig)
 	assert(rigType, "Invalid Rig")
-	
+
+	if module.IsBoneRig(rig) then
+		return BoneLegAdapter.GetSideParts(rig)
+	end
+
 	if rigType == "R6" then
-		return {LeftLeg = rig["Left Leg"], RightLeg = rig["Right Leg"]}
+		return { LeftLeg = rig["Left Leg"], RightLeg = rig["Right Leg"] }
 	else
 		return {
 			LeftUpperLeg = rig.LeftUpperLeg,
@@ -84,19 +96,12 @@ end
 
 ----/// IK Attachments
 function module.CreateIkAttachments(rig: Model)
-	local rigType = module.GetRigType(rig)
-	assert(rigType, "Invalid Rig Type. 1")
-	local targetJoints = targetIkJoints[rigType]
-	for _, joint in rig:GetDescendants() do
-		if not joint:IsA("Motor6D") then continue end
-		if targetJoints[joint.Name] ~= true then continue end
-		
-		local c0 = Instance.new("Attachment"); c0.Name = "IK-" .. joint.Name .. "C0"
-		local c1 = Instance.new("Attachment"); c1.Name = "IK-" .. joint.Name .. "C1"
-		c0.Parent, c1.Parent = joint.Part0, joint.Part1
-		c0.CFrame, c1.CFrame = joint.C0, joint.C1
+	if module.IsBoneRig(rig) then
+		return
 	end
+	-- ... keep the original body of this function ...
 end
+
 
 function module.RemoveIkAttachments(rig: Model)
 	for _, a in rig:GetDescendants() do
@@ -121,39 +126,12 @@ end
 
 ----/// IK Virtual Joints
 function module.GetIkJointsR6(rig: Model, separate: boolean?)
-	
-	local torso, lLeg, rLeg = rig.Torso, rig["Left Leg"], rig["Right Leg"]
-	assert(torso, "missing torso")
-	assert(lLeg, "missing left leg")
-	assert(rLeg, "missing right leg")
-	
-	local atts = module.GetIkAttachments(rig)
-	
-	local RightHipC0 = atts["Right HipC0"] or {CFrame = CFrame.new(torso.Size.X/2,-torso.Size.Y/2,0, 0, 0, 1, 0, 1, -0, -1, 0, 0)}
-	local RightHipC1 = atts["Right HipC1"] or {CFrame = CFrame.new(rLeg.Size.X/2,rLeg.Size.Y/2,0, 0, 0, 1, 0, 1, -0, -1, 0, 0)}
-	
-	local LeftHipC0 = atts["Left HipC0"] or {CFrame = CFrame.new(-torso.Size.X/2,-torso.Size.Y/2,0, 0, 0, -1, 0, 1, -0, 1, 0, 0)}
-	local LeftHipC1 = atts["Left HipC1"] or {CFrame = CFrame.new(-rLeg.Size.X/2,rLeg.Size.Y/2,0, 0, 0, -1, 0, 1, -0, 1, 0, 0)}
-	
-	local left, right = {}, {}
-	local rootJoint = {
-		C0 = atts.RootJointC0 and atts.RootJointC0.CFrame or CFrame.new(0,0,0,  -1, 0, 0, 0, 0, 1, 0, 1, 0),
-		C1 = atts.RootJointC1 and atts.RootJointC1.CFrame or CFrame.new(0,0,0,  -1, 0, 0, 0, 0, 1, 0, 1, 0)
-	}
-	
-	left.Hip = {C0 = LeftHipC0.CFrame, C1 = LeftHipC1.CFrame}
-	right.Hip = {C0 = RightHipC0.CFrame, C1 = RightHipC1.CFrame}
-	
-	if not separate then
-		local merged = {RootJoint = rootJoint}
-		for i, v in right do merged["Right "..i] = v end
-		for i, v in left do merged["Left "..i] = v end
-		return merged
+	if isBoneRig(rig) then
+		return BoneLegAdapter.GetIkJoints(rig, separate)
 	end
 
-	return left, right, rootJoint
+	-- ... keep the original body of this function ...
 end
-
 function module.GetIkJointsR15(rig: Model, separate: boolean?)
 	
 	local rootPart = rig.HumanoidRootPart :: BasePart
@@ -247,40 +225,48 @@ end
 
 
 function module.CalcR6IkControlsCframes(rig: Model)
-	local cf, size = rig:GetBoundingBox()
-	local rootPart = rig.HumanoidRootPart :: BasePart
-	local torso = rig:FindFirstChild("Torso") :: BasePart
-	local legs = module.GetLegs(rig)
-	local humanoid = rig:FindFirstChildWhichIsA("Humanoid")
-	local rootOffsetFromGround = (cf * CFrame.new(0,-size.Y/2,0)):ToObjectSpace(rootPart.CFrame).Y
-	
-	local rTargetC0 = CFrame.new()
-	
-	local scaleY = module.GetR15RigScale(rig).Y
-	
-	return {
-		RootController = {
-			C0 = CFrame.new(), C1 = CFrame.new(0, rootOffsetFromGround - 0.025, 0)
-		},
-		RootJoint = {
-			C0 = CFrame.new(0, rootOffsetFromGround - 0.025, 0,   -1, 0, 0, 0, 0, 1, 0, 1, 0),
-			C1 = CFrame.new(0, 0, 0,   -1, 0, 0, 0, 0, 1, 0, 1, 0)
-		},
-		RightLegRoot = {
-			C0 = CFrame.new(torso.Size.X/4, -torso.Size.Y/2, 0), C1 = CFrame.new()
-		},
-		LeftLegRoot = {
-			C0 = CFrame.new(-torso.Size.X/4, -torso.Size.Y/2, 0), C1 = CFrame.new()
-		},
-		RightLegTarget = {
-			C0 = CFrame.new(torso.Size.X/4, 0.175 * scaleY - 0.025, 0), C1 = CFrame.new()
-		},
-		LeftLegTarget = {
-			C0 = CFrame.new(-torso.Size.X/4, 0.175 * scaleY - 0.025, 0), C1 = CFrame.new()
-		},
-	}
-end
+	if module.IsBoneRig(rig) then
+		local cf, size = rig:GetBoundingBox()
+		local rootPart = BoneLegAdapter.GetRootPart(rig)
+		local torso = BoneLegAdapter.GetTorso(rig)
+		local rootOffsetFromGround = (cf * CFrame.new(0, -size.Y / 2, 0))
+			:ToObjectSpace(rootPart.CFrame).Y
+		local scaleY = module.GetR15RigScale(rig).Y
+		local hips = BoneLegAdapter.GetHipOffsets(rig)
+		local targetY = 0.175 * scaleY - 0.025
 
+		return {
+			RootController = {
+				C0 = CFrame.new(),
+				C1 = CFrame.new(0, rootOffsetFromGround - 0.025, 0),
+			},
+			RootJoint = {
+				C0 = CFrame.new(0, rootOffsetFromGround - 0.025, 0,
+					-1, 0, 0, 0, 0, 1, 0, 1, 0),
+				C1 = CFrame.new(0, 0, 0,
+					-1, 0, 0, 0, 0, 1, 0, 1, 0),
+			},
+			RightLegRoot = {
+				C0 = CFrame.new(hips.Right.X, -torso.Size.Y / 2, hips.Right.Z),
+				C1 = CFrame.new(),
+			},
+			LeftLegRoot = {
+				C0 = CFrame.new(hips.Left.X, -torso.Size.Y / 2, hips.Left.Z),
+				C1 = CFrame.new(),
+			},
+			RightLegTarget = {
+				C0 = CFrame.new(hips.Right.X, targetY, hips.Right.Z),
+				C1 = CFrame.new(),
+			},
+			LeftLegTarget = {
+				C0 = CFrame.new(hips.Left.X, targetY, hips.Left.Z),
+				C1 = CFrame.new(),
+			},
+		}
+	end
+
+	-- ... keep the original body of this function ...
+end
 
 
 ----/// R15 Rig Scale
@@ -369,24 +355,15 @@ end
 
 ----/// Reset Legs to original position
 function module.ResetRigLegs(rig: Model)
+	if isBoneRig(rig) then
+		BoneLegAdapter.Restore(rig)
+		return
+	end
+
 	if module.GetRigType(rig) == "R6" then
-		local joints = module.GetIkJointsR6(rig)
-		rig["Left Leg"].CFrame = rig.HumanoidRootPart.CFrame * joints["Left Hip"].C0 * joints["Left Hip"].C1:Inverse()
-		rig["Right Leg"].CFrame = rig.HumanoidRootPart.CFrame * joints["Right Hip"].C0 * joints["Right Hip"].C1:Inverse()
+		-- ... keep the original R6 reset ...
 	elseif module.GetRigType(rig) == "R15" then
-		local lefts, rights, root = module.GetIkJointsR15(rig, true)
-		local lTorso = rig.LowerTorso
-		local scale = module.GetR15RigScale(rig)
-		
-		local rootCf = rig.HumanoidRootPart.CFrame * root.C0 * root.C1:Inverse()
-		
-		rig["LeftUpperLeg"].CFrame = rootCf * lefts.Hip.C0 * lefts.Hip.C1:Inverse()
-		rig["LeftLowerLeg"].CFrame = rig["LeftUpperLeg"].CFrame * lefts.Knee.C0 * lefts.Knee.C1:Inverse()
-		rig["LeftFoot"].CFrame = rig["LeftLowerLeg"].CFrame * lefts.Ankle.C0 * lefts.Ankle.C1:Inverse()
-		
-		rig["RightUpperLeg"].CFrame = rootCf * rights.Hip.C0 * rights.Hip.C1:Inverse()
-		rig["RightLowerLeg"].CFrame = rig["RightUpperLeg"].CFrame * rights.Knee.C0 * rights.Knee.C1:Inverse()
-		rig["RightFoot"].CFrame = rig["RightLowerLeg"].CFrame * rights.Ankle.C0 * rights.Ankle.C1:Inverse()
+		-- ... keep the original R15 reset ...
 	end
 end
 

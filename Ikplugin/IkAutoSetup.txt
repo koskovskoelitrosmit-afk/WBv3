@@ -1,0 +1,279 @@
+
+local SelectionService = game:GetService("Selection")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+
+local Adapter = require(script.Parent:WaitForChild("BoneLegAdapter"))
+
+local module = {}
+module.Version = "1.1.0"
+
+local CONTROL_PARTS = {
+	"RootController",
+	"LeftLegRoot",
+	"LeftLegTarget",
+	"RightLegRoot",
+	"RightLegTarget",
+}
+
+local ROOT_FOR = { Left = "LeftLegRoot", Right = "RightLegRoot" }
+local TARGET_FOR = { Left = "LeftLegTarget", Right = "RightLegTarget" }
+
+local COLORS = {
+	RootController = Color3.fromRGB(119, 200, 255),
+	LeftLegRoot = Color3.fromRGB(180, 164, 255),
+	RightLegRoot = Color3.fromRGB(180, 164, 255),
+	LeftLegTarget = Color3.fromRGB(196, 241, 90),
+	RightLegTarget = Color3.fromRGB(196, 241, 90),
+}
+
+local TAG_FALLBACK = "R6IKRig_TAG"
+
+local function getTagName()
+	local global = shared._IKRigGlobal
+	return (global and global.IKRig_Tag) or TAG_FALLBACK
+end
+
+local function inWorkspace(rig)
+	return rig:FindFirstAncestorOfClass("Workspace") ~= nil
+		or rig:FindFirstAncestorOfClass("WorldModel") ~= nil
+end
+
+local function getSides(rig)
+	local sides = {}
+	local points = Adapter.GetRestPoints(rig)
+	for sideName in points do
+		table.insert(sides, sideName)
+	end
+	table.sort(sides)
+	return sides, points
+end
+
+local function addBillboard(part)
+	if part:FindFirstChild("IKLabel") then
+		return
+	end
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "IKLabel"
+	billboard.AlwaysOnTop = true
+	billboard.Size = UDim2.fromOffset(150, 24)
+	billboard.StudsOffset = Vector3.new(0, 0.65, 0)
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.Code
+	label.TextScaled = true
+	label.TextColor3 = part.Color
+	label.TextStrokeColor3 = Color3.new(0, 0, 0)
+	label.TextStrokeTransparency = 0.35
+	label.Text = part.Name
+	label.Parent = billboard
+
+	billboard.Parent = part
+end
+
+local function styleControl(part, color)
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Massless = true
+	part.Locked = false
+	part.Material = Enum.Material.Neon
+	part.Color = color or part.Color
+	part.Transparency = 0.2
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+end
+
+local function ensureControl(rig, name, desiredCFrame, size, created)
+	local existing = rig:FindFirstChild(name)
+	if existing ~= nil then
+		if existing:IsA("BasePart") then
+			styleControl(existing)
+			return existing
+		end
+		return nil
+	end
+
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Shape = Enum.PartType.Ball
+	part.Size = size
+	part.CFrame = desiredCFrame
+	styleControl(part, COLORS[name])
+	addBillboard(part)
+	part.Parent = rig
+	table.insert(created, name)
+	return part
+end
+
+function module.GetMissing(rig)
+	local missing = {}
+	if rig == nil or not rig:IsA("Model") then
+		return { "not a Model" }
+	end
+	for _, name in CONTROL_PARTS do
+		local part = rig:FindFirstChild(name)
+		if part == nil or not part:IsA("BasePart") then
+			table.insert(missing, name)
+		end
+	end
+	if not rig:HasTag(getTagName()) then
+		table.insert(missing, "tag:" .. getTagName())
+	end
+	return missing
+end
+
+function module.HasSetup(rig)
+	return rig ~= nil and rig:IsA("Model") and #module.GetMissing(rig) == 0
+end
+
+function module.GetStatus(rig)
+	local missing = module.GetMissing(rig)
+	if #missing == 0 then
+		return "ready"
+	end
+	return "missing: " .. table.concat(missing, ", ")
+end
+
+function module.Ensure(rig)
+	if rig == nil or not rig:IsA("Model") then
+		return false, "select a Model"
+	end
+
+	-- Never assert at module load: an outdated adapter must not stop the
+	-- whole plugin from loading. Report it on the Toggle press instead.
+	if type(Adapter.GetRestPoints) ~= "function" then
+		return false, "update BoneLegAdapter to 1.1.0 (GetRestPoints missing)"
+	end
+
+	if not Adapter.IsBoneLegRig(rig) then
+		return false, "no Humanoid or no thigh/knee pair — edit CONFIG.Sides first"
+	end
+	if not inWorkspace(rig) then
+		return false, "move the rig into Workspace first"
+	end
+
+	for _, name in CONTROL_PARTS do
+		local existing = rig:FindFirstChild(name)
+		if existing ~= nil and not existing:IsA("BasePart") then
+			return false, name .. " is occupied by " .. existing.ClassName
+		end
+	end
+
+	if module.HasSetup(rig) then
+		return true, "already configured"
+	end
+
+	local sides, points = getSides(rig)
+	if #sides == 0 then
+		return false, "adapter did not find any leg side"
+	end
+
+	ChangeHistoryService:SetWaypoint("IKRigPlugin/AutoSetup")
+
+	-- A previous IK pass may have left a solved pose. Capture the true bind
+	-- pose before reading hip/ankle positions for the new controls.
+	Adapter.Restore(rig)
+	Adapter.Bind(rig)
+	points = Adapter.GetRestPoints(rig)
+
+	local rootPart = Adapter.GetRootPart(rig)
+	if rootPart ~= nil and rig.PrimaryPart == nil then
+		rig.PrimaryPart = rootPart
+	end
+
+	local modelCFrame, modelSize = rig:GetBoundingBox()
+	local footprint = math.max(modelSize.X, modelSize.Z)
+	local groundCFrame = modelCFrame * CFrame.new(0, -modelSize.Y / 2 + 0.12, 0)
+
+	local created = {}
+	ensureControl(
+		rig,
+		"RootController",
+		groundCFrame,
+		Vector3.new(math.max(footprint / 3.2, 0.6), 0.3, math.max(footprint / 3.2, 0.6)),
+		created
+	)
+
+	for _, sideName in sides do
+		local data = points[sideName]
+		local rootName = ROOT_FOR[sideName]
+		local targetName = TARGET_FOR[sideName]
+
+		if rootName ~= nil then
+			ensureControl(
+				rig,
+				rootName,
+				CFrame.new(data.Hip),
+				Vector3.new(0.45, 0.45, 0.45),
+				created
+			)
+		end
+		if targetName ~= nil and data.Ankle ~= nil then
+			ensureControl(
+				rig,
+				targetName,
+				CFrame.new(data.Ankle - Vector3.new(0, 0.2, 0)),
+				Vector3.new(0.6, 0.6, 0.6),
+				created
+			)
+		end
+	end
+
+	rig:AddTag(getTagName())
+	rig:SetAttribute("IKAutoSetup", module.Version)
+	Adapter.Bind(rig)
+
+	ChangeHistoryService:SetWaypoint("IKRigPlugin/AutoSetupDone")
+
+	local missingAfter = module.GetMissing(rig)
+	if #missingAfter > 0 then
+		return false, "incomplete: " .. table.concat(missingAfter, ", ")
+	end
+
+	local report = {
+		string.format("[IkAutoSetup %s] %s", module.Version, rig.Name),
+		"  sides: " .. table.concat(sides, ", "),
+		"  created: " .. (#created > 0 and table.concat(created, ", ") or "none (repaired)"),
+		"  now press Toggle IK: targets are ready to drag",
+	}
+	print(table.concat(report, "\n"))
+	Adapter.PrintReport(rig)
+
+	return true, "controls ready (" .. table.concat(sides, " + ") .. ")"
+end
+
+-- Called by Tools/IKToggle on every press. Only models with a Humanoid and
+-- a valid thigh/knee chain are touched; anything else is left alone.
+function module.EnsureSelection()
+	local results = {}
+	for _, item in SelectionService:Get() do
+		if item:IsA("Model") and Adapter.IsBoneLegRig(item) then
+			local ok, message = module.Ensure(item)
+			table.insert(results, {
+				rig = item,
+				ok = ok,
+				message = message,
+			})
+		end
+	end
+	return results
+end
+
+-- Optional: command-bar helper if you ever want to force a rebuild.
+function module.Repair(rig)
+	for _, name in CONTROL_PARTS do
+		local existing = rig:FindFirstChild(name)
+		if existing ~= nil and existing:IsA("BasePart") then
+			existing:Destroy()
+		end
+	end
+	rig:RemoveTag(getTagName())
+	return module.Ensure(rig)
+end
+
+return module

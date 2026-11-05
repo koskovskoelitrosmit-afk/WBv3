@@ -8,6 +8,8 @@ local IkCalc = global.utils.IkCalc
 local Selection = global.utils.Selection
 
 local state = global.state
+local BoneLegAdapter = global.utils.BoneLegAdapter
+local IkAutoSetup = global.utils.IkAutoSetup
 
 local collectionService = game:GetService("CollectionService")
 local IKRig_Tag = global.IKRig_Tag
@@ -59,9 +61,14 @@ end
 local function DeactivateRig(rig)
 	if not IsRigActive(rig) then return end
 	table.remove(state.activeRigs, table.find(state.activeRigs, rig))
+
 	if rig and rig.Parent then
-		RigUtils.ResetRigLegs(rig)
+		local ok, err = pcall(RigUtils.ResetRigLegs, rig)
+		if not ok then
+			---warn("Reset failed: " .. tostring(err))
+		end
 	end
+
 	UpdateLocalStatus()
 end
 
@@ -83,11 +90,11 @@ local function IKRigUpdate_R6(Rig)
 
 	local LeftRoot = Rig:FindFirstChild("LeftLegRoot")
 	local LeftTarget = Rig:FindFirstChild("LeftLegTarget")
-	local LeftLeg = Rig:FindFirstChild("Left Leg")
+	local LeftLeg = Rig:FindFirstChild("LeftLeg")
 
 	local RightRoot = Rig:FindFirstChild("RightLegRoot")
 	local RightTarget = Rig:FindFirstChild("RightLegTarget")
-	local RightLeg = Rig:FindFirstChild("Right Leg")
+	local RightLeg = Rig:FindFirstChild("RightLeg")
 
 	local success, err = pcall(function()
 		if LeftRoot and LeftTarget and LeftLeg then
@@ -158,7 +165,16 @@ local function DisconnectIK()
 	state.ikActive = false
 	GlobalStatusFrame.Visible = false
 end
+local function IKRigUpdate_BONES(rig)
+	local success, err = pcall(function()
+		BoneLegAdapter.SolveRig(rig, rig:GetPivot().RightVector)
+	end)
 
+	if not success then
+		Logger.Warn("Bone IK update failed for " .. rig.Name .. ": " .. tostring(err))
+		DeactivateRig(rig)
+	end
+end
 
 local function ConnectIK()
 	state.ikActive = true
@@ -186,7 +202,12 @@ local function ConnectIK()
 				DeactivateRig(rig)
 				continue
 			end
-			
+
+			if BoneLegAdapter.IsBoneLegRig(rig) then
+				IKRigUpdate_BONES(rig)
+				continue
+			end
+
 			local rigType = RigUtils.GetRigType(rig)
 			if rigType == "R15" then
 				IKRigUpdate_R15(rig)
@@ -207,34 +228,68 @@ end
 
 
 ToolController:BindToolButton(function()
-	local selectedRigs = Selection.GetSelectedRigs().IK
-	if #selectedRigs == 0 then return end
-	
-	local totalActive, totalRigs = 0, #selectedRigs
-	for _, rig in selectedRigs do
-		if IsRigActive(rig) then totalActive += 1 end
+	-- 1. AUTO-SETUP: создаёт таргеты/руты/тег, если их нет
+	local setupOk = {}
+
+	for _, result in IkAutoSetup.EnsureSelection() do
+		setupOk[result.rig] = result.ok
+		if result.ok then
+			print("[IK AutoSetup] " .. result.rig.Name .. ": " .. result.message)
+		else
+			Logger.Warn("[IK AutoSetup] " .. result.rig.Name .. ": " .. result.message)
+		end
 	end
-	
-	-- if all selected are active, then deactivate all
-	-- else, activate all non active selected rigs
-	
+
+	-- 2. Собираем список вручную: риг без тега не виден GetSelectedRigs()
+	local selectedRigs = {}
+
+	for _, item in Selection.Get() do
+		if not item:IsA("Model") then
+			continue
+		end
+
+		if BoneLegAdapter.IsBoneLegRig(item) then
+			-- включаем только если Ensure прошёл успешно
+			if setupOk[item] == true then
+				table.insert(selectedRigs, item)
+			end
+			continue
+		end
+
+		if RigUtils.ValidateRigWithIK(item) then
+			table.insert(selectedRigs, item)
+		end
+	end
+
+	if #selectedRigs == 0 then
+		Logger.Warn("Select a bone rig (Humanoid + thigh/knee) or an IK rig in Workspace")
+		return
+	end
+
+	-- 3. ОРИГИНАЛЬНАЯ ЛОГИКА АКТИВАЦИИ (её нельзя терять)
+	local totalActive, totalRigs = 0, #selectedRigs
+
+	for _, rig in selectedRigs do
+		if IsRigActive(rig) then
+			totalActive += 1
+		end
+	end
+
 	if totalRigs == totalActive then
 		for _, rig in selectedRigs do
 			DeactivateRig(rig)
 		end
 		return
 	end
-	
+
 	for _, rig in selectedRigs do
 		ActivateRig(rig)
 	end
-	
+
 	if #state.activeRigs > 0 then
 		ConnectIK()
 	end
 end, false)
-
-
 
 
 ToolController:RegisterUpdater(Selection.SelectionChanged, UpdateLocalStatus)

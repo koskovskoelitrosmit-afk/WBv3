@@ -1,22 +1,37 @@
 --!nonstrict
 --[[
-	Utils / BoneLegAdapter  2.0.0-arms
-
-	Ноги: RightLegTarget / LeftLegTarget + RightKneePole / LeftKneePole
-	Руки: RightHandTarget / LeftHandTarget + RightElbowPole / LeftElbowPole
-
-	Двигаются только Bone.Transform (root и mid кости).
-	MeshPart, Motor6D, WeldConstraint не изменяются.
+    Utils / BoneLegAdapter  2.1.0-roots
+ 
+    Ноги: RightLegTarget / LeftLegTarget + RightKneePole / LeftKneePole
+    Руки: RightHandTarget / LeftHandTarget + RightElbowPole / LeftElbowPole
+ 
+    НОВОЕ (2.1.0): RootControl-хэндлы для корней цепочек
+      RightLegRootControl / LeftLegRootControl
+      RightArmRootControl / LeftArmRootControl
+    Двигаешь хэндл -> корневая кость (RightBoneRoot, LeftLegBoneRoot, ...)
+    переезжает в эту точку (Bone.Transform получает смещение),
+    а IK-цепочка продолжает тянуться к таргету и смотреть на pole.
+    Если хэндла нет, поведение такое же, как в 2.0.0.
+ 
+    Двигаются только Bone.Transform (root и mid кости).
+    MeshPart, Motor6D, WeldConstraint не изменяются.
 ]]
 
 local module = {}
-module.Version = "2.0.0-arms"
+module.Version = "2.1.0-roots"
 
 module.Config = {
 	AutoDetect = true,
 	BendSign = 1,
 	TargetSize = 0.7,
 	PoleSize = 0.55,
+	RootSize = 0.6,
+
+	-- true  = корень можно двигать хэндлом (RootControl)
+	-- false = старое поведение, корень жёстко привязан к мешу
+	RootControlsEnabled = true,
+	-- смещения меньше этого значения (в studs) считаются нулевыми
+	RootEpsilon = 0.0005,
 	TargetColor = {
 		Leg = Color3.fromRGB(196, 241, 90),
 		Arm = Color3.fromRGB(119, 200, 255),
@@ -25,6 +40,10 @@ module.Config = {
 		Leg = Color3.fromRGB(180, 164, 255),
 		Arm = Color3.fromRGB(255, 207, 112),
 	},
+	RootColor = {
+		Leg = Color3.fromRGB(255, 120, 160),
+		Arm = Color3.fromRGB(255, 150, 90),
+	},
 	Tag = "R6IKRig_TAG",
 
 	Legs = {
@@ -32,12 +51,14 @@ module.Config = {
 			Root = "RightBoneRoot", Mid = "RightBoneKnee", End = nil,
 			Mesh = "RightLeg_NewMesh",
 			Target = "RightLegTarget", Pole = "RightKneePole",
+			RootControl = "RightLegRootControl",
 			Length = nil,
 		},
 		Left = {
 			Root = "LeftLegBoneRoot", Mid = "LeftLegKnee", End = nil,
 			Mesh = "LeftLeg_NewMesh",
 			Target = "LeftLegTarget", Pole = "LeftKneePole",
+			RootControl = "LeftLegRootControl",
 			Length = nil,
 		},
 	},
@@ -46,11 +67,13 @@ module.Config = {
 		Right = {
 			Root = nil, Mid = nil, End = nil, Mesh = nil,
 			Target = "RightHandTarget", Pole = "RightElbowPole",
+			RootControl = "RightArmRootControl",
 			Length = nil,
 		},
 		Left = {
 			Root = nil, Mid = nil, End = nil, Mesh = nil,
 			Target = "LeftHandTarget", Pole = "LeftElbowPole",
+			RootControl = "LeftArmRootControl",
 			Length = nil,
 		},
 	},
@@ -61,6 +84,10 @@ module.Config.Left = module.Config.Legs.Left
 module.Config.Targets = {
 	Right = module.Config.Legs.Right.Target,
 	Left = module.Config.Legs.Left.Target,
+}
+module.Config.RootControls = {
+	Right = module.Config.Legs.Right.RootControl,
+	Left = module.Config.Legs.Left.RootControl,
 }
 
 local CONFIG = module.Config
@@ -424,7 +451,17 @@ local function captureChain(rig, sideName, kind, config, claimed, warnings)
 
 		Target = nil,
 		Pole = nil,
+		RootControl = nil,
 	}
+end
+
+local function configFor(chain)
+	return chain.Kind == "Arm" and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
+end
+
+-- Текущая "родная" позиция корня (следует за мешем, если риг двигали)
+local function restRootWorld(chain)
+	return chain.Mesh.CFrame:PointToWorldSpace(chain.LocalRoot)
 end
 
 local function bind(rig)
@@ -457,6 +494,7 @@ local function bind(rig)
 		local config = chain.Kind == "Arm" and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
 		chain.Target = rig:FindFirstChild(config.Target)
 		chain.Pole = rig:FindFirstChild(config.Pole)
+		chain.RootControl = config.RootControl and rig:FindFirstChild(config.RootControl) or nil
 	end
 
 	cache[rig] = meta
@@ -517,6 +555,7 @@ function module.GetSides(rig)
 			Mesh = chain.Mesh,
 			Target = chain.Target,
 			Pole = chain.Pole,
+			RootControl = chain.RootControl,
 			L1 = chain.L1,
 			L2 = chain.L2,
 		})
@@ -528,16 +567,54 @@ function module.GetTargets(rig)
 	local list = {}
 	local seen = {}
 
+	local function add(part)
+		if part and part:IsA("BasePart") and not seen[part] then
+			seen[part] = true
+			table.insert(list, part)
+		end
+	end
+
 	for _, chain in module.GetChains(rig) do
-		for _, part in { chain.Target, chain.Pole } do
-			if part and part:IsA("BasePart") and not seen[part] then
-				seen[part] = true
-				table.insert(list, part)
-			end
+		add(chain.Target)
+		add(chain.Pole)
+		add(chain.RootControl)
+	end
+
+	return list
+end
+
+-- Только хэндлы корней (RightLegRootControl, LeftLegRootControl, ...)
+function module.GetRootControls(rig)
+	local list = {}
+
+	for _, chain in module.GetChains(rig) do
+		local part = chain.RootControl
+		if not part or not part.Parent then
+			local config = configFor(chain)
+			part = config.RootControl and rig:FindFirstChild(config.RootControl) or nil
+			chain.RootControl = part
+		end
+		if part and part:IsA("BasePart") then
+			table.insert(list, part)
 		end
 	end
 
 	return list
+end
+
+-- Вернуть хэндлы корней в родное положение (корень кости на месте)
+function module.ResetRootControls(rig)
+	local count = 0
+
+	for _, chain in module.GetChains(rig) do
+		local part = chain.RootControl
+		if part and part.Parent and chain.Mesh.Parent then
+			part.CFrame = CFrame.new(restRootWorld(chain))
+			count += 1
+		end
+	end
+
+	return count
 end
 
 local function addLabel(part)
@@ -669,6 +746,27 @@ function module.EnsureControls(rig)
 
 		chain.Target = target
 		chain.Pole = pole
+
+		-- RootControl: хэндл корневой кости (RightBoneRoot и т.п.)
+		if CONFIG.RootControlsEnabled and config.RootControl then
+			local hadRootControl = chain.RootControl ~= nil
+
+			local rootControl, rootError = ensureControl(
+				rig,
+				config.RootControl,
+				restRootWorld(chain),
+				isArm and CONFIG.RootColor.Arm or CONFIG.RootColor.Leg,
+				CONFIG.RootSize,
+				Enum.PartType.Block
+			)
+
+			if not rootControl then
+				return false, rootError
+			end
+
+			if not hadRootControl then created += 1 end
+			chain.RootControl = rootControl
+		end
 	end
 
 	local tag = CONFIG.Tag
@@ -689,12 +787,13 @@ function module.EnsureControls(rig)
 	print("[Bone IK] контролы готовы, новых объектов: " .. created)
 	for _, chain in meta.Chains do
 		print(string.format(
-			"  %s %s / %s | target=%s | pole=%s",
+			"  %s %s / %s | target=%s | pole=%s | rootControl=%s",
 			chain.Kind,
 			chain.Root.Name,
 			chain.Mid.Name,
 			chain.Target and chain.Target.Name or "MISSING",
-			chain.Pole and chain.Pole.Name or "MISSING"
+			chain.Pole and chain.Pole.Name or "MISSING",
+			chain.RootControl and chain.RootControl.Name or "off"
 			))
 	end
 
@@ -748,14 +847,41 @@ local function solveChain(rig, chain)
 		chain.Pole = pole
 	end
 
+	local rootControl = nil
+	if CONFIG.RootControlsEnabled then
+		rootControl = chain.RootControl
+		if not rootControl or not rootControl.Parent then
+			local config = configFor(chain)
+			rootControl = config.RootControl and rig:FindFirstChild(config.RootControl) or nil
+			chain.RootControl = rootControl
+		end
+	end
+
 	if not chain.Root.Parent or not chain.Mid.Parent or not chain.Mesh.Parent then
 		return
 	end
 
 	local meshCFrame = chain.Mesh.CFrame
-	local rootPosition = meshCFrame:PointToWorldSpace(chain.LocalRoot)
+	local restRoot = meshCFrame:PointToWorldSpace(chain.LocalRoot)
+	local rootPosition = restRoot
 	local restMid = meshCFrame:PointToWorldSpace(chain.LocalMid)
 	local restEnd = meshCFrame:PointToWorldSpace(chain.LocalEnd)
+
+	-- Смещение корня: куда пользователь утащил RootControl относительно родного места.
+	-- Вся rest-цепочка переезжает на это смещение целиком (длины костей не меняются).
+	local rootOffset = Vector3.zero
+	if rootControl and rootControl:IsA("BasePart") then
+		rootOffset = rootControl.CFrame.Position - restRoot
+		if rootOffset.Magnitude < CONFIG.RootEpsilon then
+			rootOffset = Vector3.zero
+		end
+	end
+
+	if rootOffset ~= Vector3.zero then
+		rootPosition = restRoot + rootOffset
+		restMid = restMid + rootOffset
+		restEnd = restEnd + rootOffset
+	end
 
 	local rootRestRotation = meshCFrame.Rotation * chain.RootRestRotation
 	local midRestRotation = meshCFrame.Rotation * chain.MidRestRotation
@@ -810,10 +936,12 @@ local function solveChain(rig, chain)
 
 	local delta1 = swing(restMid - rootPosition, solvedMid - rootPosition)
 
-	chain.Root.Transform =
-		rootRestRotation:Inverse()
-		* delta1
-		* rootRestRotation
+	-- Поворот вокруг (уже сдвинутого) корня + перенос корня в точку RootControl.
+	-- Смещение переводим в локальные оси кости: Final = Rest * Transform.
+	local rootRotation = rootRestRotation:Inverse() * delta1 * rootRestRotation
+	local localOffset = rootRestRotation:VectorToObjectSpace(rootOffset)
+
+	chain.Root.Transform = CFrame.new(localOffset) * rootRotation
 
 	local inheritedEnd = delta1 * (restEnd - restMid)
 	local delta2 = swing(inheritedEnd, solvedEnd - solvedMid)

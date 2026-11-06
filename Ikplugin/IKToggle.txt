@@ -1,21 +1,23 @@
 --!nonstrict
 --[[
-	Tools / IKToggle  1.4.0-moonik
-
-	Режим IK внутри MoonAnimator:
-	  MoonAnimator ключует RightLegTarget / LeftLegTarget (обычные BasePart),
-	  плагин каждый кадр считает по ним позу бедра и колена.
-
-	Требуется Utils/BoneLegAdapter 1.3.0-moon (без изменений).
-
-	Кнопки:
-	  Toggle IK        — создать таргеты и включить/выключить live-IK
-	  Select IK Parts  — выделить таргеты, чтобы добавить их в MoonAnimator
-	  Record IK        — писать ключи костей во время проигрывания Moon
-	  Bake IK          — сохранить запись в KeyframeSequence
-
-	Для bone-рига НЕ используются Utils/Rig, IkCalc, IkAutoSetup
-	и обращение rig["Left Leg"].
+    Tools / IKToggle  1.5.0-roots
+ 
+    Режим IK внутри MoonAnimator:
+      MoonAnimator ключует таргеты / поулы / RootControl (обычные BasePart),
+      плагин каждый кадр считает по ним позу корня и середины цепочки.
+ 
+    Требуется Utils/BoneLegAdapter 2.1.0-roots.
+ 
+    Кнопки:
+      Toggle IK         — создать контролы и включить/выключить live-IK
+      Select IK Parts   — выделить ВСЕ контролы (таргеты, поулы, корни)
+      Select IK Roots   — выделить только хэндлы корней (RightLegRootControl ...)
+      Reset Roots       — вернуть хэндлы корней в родное положение
+      Record IK        — писать ключи костей во время проигрывания Moon
+      Bake IK          — сохранить запись в KeyframeSequence
+ 
+    Для bone-рига НЕ используются Utils/Rig, IkCalc, IkAutoSetup
+    и обращение rig["Left Leg"].
 ]]
 
 local global = shared._IKRigGlobal
@@ -27,7 +29,7 @@ local RunService = game:GetService("RunService")
 local SelectionService = game:GetService("Selection")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-print("[IK Toggle] 1.4.0-moonik | adapter="
+print("[IK Toggle] 1.5.0-roots | adapter="
 	.. tostring(Adapter and Adapter.Version or "MISSING"))
 
 local RECORD_FPS = 30
@@ -66,6 +68,18 @@ local ToolController = global.classes.PluginToolController.new(toolbar, {
 local selectButton = toolbar:CreateButton(
 	"Select IK Parts",
 	"Выделить таргеты ног для добавления в MoonAnimator",
+	""
+)
+
+local selectRootsButton = toolbar:CreateButton(
+	"Select IK Roots",
+	"Выделить хэндлы корней (RightLegRootControl, LeftLegRootControl, руки)",
+	""
+)
+
+local resetRootsButton = toolbar:CreateButton(
+	"Reset Roots",
+	"Вернуть хэндлы корней в родное положение",
 	""
 )
 
@@ -451,7 +465,8 @@ local function startIK(rig)
 			))
 	end
 
-	print("  Управление: двигай RightLegTarget / LeftLegTarget в MoonAnimator.")
+	print("  Управление: двигай таргеты, поулы и *RootControl в MoonAnimator.")
+	print("  Корни: RightLegRootControl / LeftLegRootControl / RightArmRootControl / LeftArmRootControl.")
 	print("  Кости в Moon не добавляй, иначе Moon перезапишет IK.")
 
 	return true
@@ -479,16 +494,8 @@ local function selectIkParts()
 		end
 	end
 
-	local targets = {}
-	local config = Adapter.Config
-
-	for _, name in { "Right", "Left" } do
-		local targetName = config.Targets[name]
-		local part = rig:FindFirstChild(targetName)
-		if part and part:IsA("BasePart") then
-			table.insert(targets, part)
-		end
-	end
+	-- таргеты + поулы + RootControl для всех цепочек (ноги и руки)
+	local targets = Adapter.GetTargets(rig)
 
 	if #targets == 0 then
 		warn("[IK Toggle] таргеты не созданы")
@@ -504,12 +511,55 @@ local function selectIkParts()
 	end
 	print("")
 	print("  Дальше в MoonAnimator:")
-	print("  1. Нажми Add Item / 9 и добавь оба выделенных таргета.")
-	print("  2. У таргетов появится CFrame-трек.")
-	print("  3. Двигай таргеты и ставь ключи (+) на нужных кадрах.")
+	print("  1. Нажми Add Item / 9 и добавь все выделенные контролы.")
+	print("  2. У каждого появится CFrame-трек.")
+	print("  3. Двигай таргеты, поулы и *RootControl, ставь ключи (+).")
+	print("     *RootControl двигает корень кости (RightBoneRoot и т.д.).")
 	print("  4. Кости и сам Rig в Moon не добавляй.")
 	print("  5. Во время Play плагин сам держит IK-позу.")
 	print("==============================================")
+end
+
+-- ============================================================
+-- Корни: выделить / сбросить
+-- ============================================================
+local function selectRootControls()
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели риг")
+		return
+	end
+
+	if not state.active then
+		if not startIK(rig) then
+			return
+		end
+	end
+
+	local roots = Adapter.GetRootControls(rig)
+	if #roots == 0 then
+		warn("[IK Toggle] RootControl не найдены (проверь Config.RootControlsEnabled)")
+		return
+	end
+
+	SelectionService:Set(roots)
+
+	print("[IK Toggle] выделены хэндлы корней:")
+	for _, part in roots do
+		print("  " .. part:GetFullName())
+	end
+	print("  Двигай их Move-тулом или добавь в MoonAnimator и ставь ключи.")
+end
+
+local function resetRootControls()
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели риг")
+		return
+	end
+
+	local count = Adapter.ResetRootControls(rig)
+	print("[IK Toggle] хэндлов корней сброшено: " .. tostring(count))
 end
 
 -- ============================================================
@@ -539,6 +589,14 @@ end, false)
 
 selectButton.Click:Connect(function()
 	selectIkParts()
+end)
+
+selectRootsButton.Click:Connect(function()
+	selectRootControls()
+end)
+
+resetRootsButton.Click:Connect(function()
+	resetRootControls()
 end)
 
 recordButton.Click:Connect(function()

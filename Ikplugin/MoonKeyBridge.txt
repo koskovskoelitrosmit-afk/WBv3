@@ -1,0 +1,393 @@
+--!nonstrict
+--[[
+	Utils / MoonKeyBridge  1.0.0
+
+	Связка IK-таргетов и MoonAnimator.
+
+	MoonAnimator двигает и ключует RightLegTarget / LeftLegTarget.
+	Этот модуль в те же номера кадров снимает позы костей и собирает
+	KeyframeSequence, который Moon импортирует как bone-анимацию.
+
+	API:
+	  GetMoon()
+	  GetFPS()
+	  GetFrame()
+	  SetFrameOverride(frame, fps)
+	  GetTargets(rig)
+	  Capture(rig, frame?)
+	  AutoStart(rig) / AutoStop()
+	  Poll()
+	  GetStats()
+	  BuildSequence(rig, name?)
+	  Clear()
+]]
+
+local module = {}
+module.Version = "1.0.0"
+
+local MoonClass = nil
+local cacheRig = nil
+local cacheSides = nil
+local samples = {}
+local listening = false
+local lastTargetState = nil
+local lastFrame = -1
+local autoStartClock = 0
+local autoFrameBase = 0
+
+local function getPlugin()
+	local global = shared._IKRigGlobal
+	return global and global.plugin
+end
+
+function module.GetMoon()
+	local moon = _G.MoonGlobal
+	if moon and moon.ready then
+		return moon
+	end
+	return nil
+end
+
+-- Ручной режим: базовый кадр + fps. Сбрасывает отсчёт времени.
+function module.SetFrameOverride(frame, fps)
+	MoonClass = MoonClass or {}
+	MoonClass.manualBase = math.max(0, math.floor(frame or 0))
+	MoonClass.manualFPS = fps or module.GetFPS()
+	MoonClass.manualClock = os.clock()
+end
+
+function module.GetFPS()
+	local manual = MoonClass and MoonClass.manualFPS
+	if manual and manual > 0 then
+		return manual
+	end
+
+	local moon = module.GetMoon()
+	local fps = moon and (moon.current_fps or moon.DEFAULT_FPS or moon.currentFPS)
+	if typeof(fps) == "number" and fps >= 1 then
+		return fps
+	end
+
+	return 60
+end
+
+local function parseFrameFromText(text)
+	if typeof(text) ~= "string" then
+		return nil
+	end
+	local digits = string.match(text, "^%s*(%d+)%s*$")
+	if digits then
+		return tonumber(digits)
+	end
+	return nil
+end
+
+function module.GetFrame()
+	if MoonClass and MoonClass.manualBase then
+		local elapsed = os.clock() - (MoonClass.manualClock or os.clock())
+		return MoonClass.manualBase + math.floor(elapsed * (MoonClass.manualFPS or 60))
+	end
+
+	local plugin = getPlugin()
+	if plugin then
+		local saved = plugin:GetSetting("MoonIK_Frame")
+		if typeof(saved) == "number" and saved >= 0 then
+			return saved
+		end
+	end
+
+	local moon = module.GetMoon()
+	if not moon then
+		return nil
+	end
+
+	for _, key in { "current_frame", "currentFrame", "frame", "playhead", "currentFramePosition" } do
+		local value = moon[key]
+		if typeof(value) == "number" then
+			return value
+		end
+	end
+
+	-- Пробуем найти номер кадра в окне Moon.
+	local uiOk, frame = pcall(function()
+		local window = moon.Windows and moon.Windows.MoonAnimator
+		local root = window and window.UI
+		if not root then
+			return nil
+		end
+
+		local best = nil
+
+		for _, descendant in root:GetDescendants() do
+			if descendant:IsA("TextLabel") or descendant:IsA("TextBox") then
+				local number = parseFrameFromText(descendant.Text)
+				if number and number < 100000 then
+					if not best or descendant.AbsolutePosition.Y < best.y then
+						best = { frame = number, y = descendant.AbsolutePosition.Y }
+					end
+				end
+			end
+		end
+
+		return best and best.frame or nil
+	end)
+
+	if uiOk then
+		return frame
+	end
+
+	return nil
+end
+
+function module.GetTargets(rig)
+	local adapter = shared._IKRigGlobal and shared._IKRigGlobal.utils.BoneLegAdapter
+	if not adapter then
+		return {}
+	end
+
+	local targets = {}
+	for _, side in { "Right", "Left" } do
+		local name = adapter.Config.Targets[side]
+		local part = rig:FindFirstChild(name)
+		if part and part:IsA("BasePart") then
+			table.insert(targets, part)
+		end
+	end
+	return targets
+end
+
+local function targetSignature(rig)
+	local signature = {}
+	for _, target in module.GetTargets(rig) do
+		table.insert(signature, target.CFrame)
+	end
+	return signature
+end
+
+local function signatureChanged(a, b)
+	if not a or not b or #a ~= #b then
+		return true
+	end
+	for index, cframe in a do
+		local first = { cframe:GetComponents() }
+		local second = { b[index]:GetComponents() }
+		for component = 1, 12 do
+			if math.abs(first[component] - second[component]) > 0.0005 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function getAdapter()
+	local utils = shared._IKRigGlobal and shared._IKRigGlobal.utils
+	return utils and utils.BoneLegAdapter
+end
+
+function module.Capture(rig, frame)
+	local adapter = getAdapter()
+	if not adapter then
+		return false, "BoneLegAdapter не загружен"
+	end
+
+	local meta = adapter.Bind(rig)
+	if not meta or not meta.Enabled then
+		return false, "адаптер не нашёл кости"
+	end
+
+	adapter.SolveRig(rig)
+
+	local resolvedFrame = frame or module.GetFrame()
+
+	if not resolvedFrame then
+		resolvedFrame = lastFrame + 1
+	end
+
+	resolvedFrame = math.max(0, math.floor(resolvedFrame + 0.5))
+	lastFrame = resolvedFrame
+
+	if samples[resolvedFrame] ~= nil then
+		return false, "кадр " .. resolvedFrame .. " уже записан"
+	end
+
+	local snapshot = {}
+
+	for _, side in meta.Sides do
+		if side.Thigh.Parent then
+			snapshot[side.Thigh.Name] = side.Thigh.Transform
+		end
+		if side.Knee.Parent then
+			snapshot[side.Knee.Name] = side.Knee.Transform
+		end
+	end
+
+	samples[resolvedFrame] = {
+		frame = resolvedFrame,
+		bones = snapshot,
+	}
+
+	return true, "кость записана в кадр " .. resolvedFrame
+end
+
+function module.GetStats()
+	local count = 0
+	local minFrame, maxFrame = nil, nil
+
+	for frame in samples do
+		count += 1
+		minFrame = minFrame and math.min(minFrame, frame) or frame
+		maxFrame = maxFrame and math.max(maxFrame, frame) or frame
+	end
+
+	return {
+		count = count,
+		minFrame = minFrame,
+		maxFrame = maxFrame,
+		fps = module.GetFPS(),
+		currentFrame = module.GetFrame(),
+		auto = listening,
+	}
+end
+
+function module.Clear()
+	samples = {}
+	lastFrame = -1
+	lastTargetState = nil
+end
+
+function module.AutoStart(rig)
+	local adapter = getAdapter()
+	if not adapter then
+		return false, "BoneLegAdapter не загружен"
+	end
+
+	if listening then
+		return true, "уже слушаю"
+	end
+
+	local ok, message = adapter.EnsureControls(rig)
+	if not ok then
+		return false, message
+	end
+
+	cacheRig = rig
+	cacheSides = adapter.GetSides(rig)
+	lastTargetState = targetSignature(rig)
+	autoStartClock = os.clock()
+	autoFrameBase = module.GetFrame() or 0
+	listening = true
+
+	return true, "авто-запись включена (" .. #cacheSides .. " стороны)"
+end
+
+function module.AutoStop()
+	listening = false
+	return true, "авто-запись выключена"
+end
+
+function module.IsAutoRunning()
+	return listening
+end
+
+function module.Poll()
+	if not listening or not cacheRig or not cacheRig.Parent then
+		return
+	end
+
+	local signature = targetSignature(cacheRig)
+
+	if signatureChanged(signature, lastTargetState) then
+		lastTargetState = signature
+
+		local frame = module.GetFrame()
+		if not frame then
+			frame = autoFrameBase + math.floor((os.clock() - autoStartClock) * module.GetFPS())
+		end
+
+		module.Capture(cacheRig, frame)
+	end
+end
+
+function module.BuildSequence(rig, name)
+	local plugin = getPlugin()
+	local fps = module.GetFPS()
+
+	local sequence = Instance.new("KeyframeSequence")
+	sequence.Name = name or ("MoonIK_" .. rig.Name)
+	sequence.Loop = false
+	sequence.Priority = Enum.AnimationPriority.Action
+	sequence.AuthoredHipHeight = 2
+
+	local frames = {}
+	for frame in samples do
+		table.insert(frames, frame)
+	end
+	table.sort(frames)
+
+	if #frames == 0 then
+		return nil, "нет записанных кадров"
+	end
+
+	local adapter = getAdapter()
+	if not adapter then
+		return nil, "BoneLegAdapter не загружен"
+	end
+
+	local sides = adapter.GetSides(rig)
+	if #sides == 0 then
+		return nil, "адаптер не нашёл стороны"
+	end
+
+	for _, frame in frames do
+		local sample = samples[frame]
+
+		local keyframe = Instance.new("Keyframe")
+		keyframe.Time = frame / fps
+		keyframe.Name = "Frame_" .. frame
+
+		local rootPose = Instance.new("Pose")
+		rootPose.Name = "HumanoidRootPart"
+		rootPose.Weight = 1
+		rootPose.CFrame = CFrame.new()
+		rootPose.Parent = keyframe
+
+		for _, side in sides do
+			local thigh = Instance.new("Pose")
+			thigh.Name = side.Thigh.Name
+			thigh.Weight = 1
+			thigh.CFrame = sample.bones[side.Thigh.Name] or CFrame.new()
+			thigh.Parent = rootPose
+
+			local knee = Instance.new("Pose")
+			knee.Name = side.Knee.Name
+			knee.Weight = 1
+			knee.CFrame = sample.bones[side.Knee.Name] or CFrame.new()
+			knee.Parent = thigh
+		end
+
+		keyframe.Parent = sequence
+	end
+
+	sequence:SetAttribute("MoonIK_FPS", fps)
+	sequence:SetAttribute("MoonIK_Frames", #frames)
+	sequence:SetAttribute("MoonIK_FromFrame", frames[1])
+	sequence:SetAttribute("MoonIK_ToFrame", frames[#frames])
+
+	local folder = game:GetService("ReplicatedStorage"):FindFirstChild("MoonIK_Recordings")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "MoonIK_Recordings"
+		folder.Parent = game:GetService("ReplicatedStorage")
+	end
+
+	sequence.Parent = folder
+
+	if plugin then
+		plugin:SetSetting("MoonIK_LastSequence", sequence.Name)
+	end
+
+	return sequence, frames[1], frames[#frames]
+end
+
+return module

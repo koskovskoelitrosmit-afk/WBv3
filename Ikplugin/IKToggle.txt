@@ -1,321 +1,577 @@
+--!nonstrict
+--[[
+	Tools / IKToggle  1.4.0-moonik
 
+	Режим IK внутри MoonAnimator:
+	  MoonAnimator ключует RightLegTarget / LeftLegTarget (обычные BasePart),
+	  плагин каждый кадр считает по ним позу бедра и колена.
+
+	Требуется Utils/BoneLegAdapter 1.3.0-moon (без изменений).
+
+	Кнопки:
+	  Toggle IK        — создать таргеты и включить/выключить live-IK
+	  Select IK Parts  — выделить таргеты, чтобы добавить их в MoonAnimator
+	  Record IK        — писать ключи костей во время проигрывания Moon
+	  Bake IK          — сохранить запись в KeyframeSequence
+
+	Для bone-рига НЕ используются Utils/Rig, IkCalc, IkAutoSetup
+	и обращение rig["Left Leg"].
+]]
 
 local global = shared._IKRigGlobal
 local toolbar = global.toolbar
 local guiUtil = global.utils.Gui
-local RigUtils = global.utils.Rig
-local IkCalc = global.utils.IkCalc
-local Selection = global.utils.Selection
+local Adapter = global.utils.BoneLegAdapter
 
-local state = global.state
-local BoneLegAdapter = global.utils.BoneLegAdapter
-local IkAutoSetup = global.utils.IkAutoSetup
+local RunService = game:GetService("RunService")
+local SelectionService = game:GetService("Selection")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local collectionService = game:GetService("CollectionService")
-local IKRig_Tag = global.IKRig_Tag
+print("[IK Toggle] 1.4.0-moonik | adapter="
+	.. tostring(Adapter and Adapter.Version or "MISSING"))
+
+local RECORD_FPS = 30
+local RECORD_LIMIT = 30
+
+local GlobalFrame
+local LocalFrame
+
+pcall(function()
+	GlobalFrame = guiUtil.GetFrame("GlobalStatus")
+end)
+pcall(function()
+	LocalFrame = guiUtil.GetFrame("LocalStatus")
+end)
+
+local state = {
+	rig = nil,
+	active = false,
+	heartbeat = nil,
+	render = nil,
+}
+
+local recorder = {
+	active = false,
+	samples = {},
+	startClock = 0,
+	lastSample = 0,
+}
 
 local ToolController = global.classes.PluginToolController.new(toolbar, {
 	Name = "Toggle IK",
-	Description = "Turn Rig IK on/off for the selected rig(s).",
-	Icon = "rbxassetid://4483362458"
+	Description = "Live bone IK для IK-контролов внутри MoonAnimator",
+	Icon = "",
 })
 
+local selectButton = toolbar:CreateButton(
+	"Select IK Parts",
+	"Выделить таргеты ног для добавления в MoonAnimator",
+	""
+)
 
+local recordButton = toolbar:CreateButton(
+	"Record IK",
+	"Писать позы костей во время проигрывания анимации",
+	""
+)
 
------------------------------------------------------
--- Utils
+local bakeButton = toolbar:CreateButton(
+	"Bake IK",
+	"Сохранить записанные позы в KeyframeSequence",
+	""
+)
 
-local function IsRigActive(rig)
-	return table.find(state.activeRigs, rig) ~= nil
-end
-
-
-local GlobalStatusFrame = guiUtil.GetFrame("GlobalStatus")
-local LocalStatusFrame = guiUtil.GetFrame("LocalStatus")
-local function UpdateLocalStatus()
-	local selectedRigs = Selection.GetSelectedRigs().IK
-	local totalActive, totalRigs = 0, #selectedRigs
-	for _, rig in selectedRigs do
-		if IsRigActive(rig) then totalActive += 1 end
+-- ============================================================
+-- MoonAnimator: только диагностика, его данные не меняем
+-- ============================================================
+task.spawn(function()
+	for _ = 1, 24 do
+		local moon = _G.MoonGlobal
+		if moon and moon.ready then
+			print("[IK Toggle] MoonAnimator обнаружен, версия " .. tostring(moon.ver))
+			print("[IK Toggle] добавляй в Moon только таргеты ног, кости не добавляй.")
+			return
+		end
+		task.wait(0.5)
 	end
 
-	if #selectedRigs == 0 then
-		LocalStatusFrame.Visible = false
+	print("[IK Toggle] MoonAnimator не обнаружен. Плагин всё равно работает.")
+end)
+
+-- ============================================================
+-- Выбор рига
+-- ============================================================
+local function getRig()
+	for _, item in SelectionService:Get() do
+		if item:IsA("Model") and item:FindFirstChildOfClass("Humanoid") then
+			return item
+		end
+
+		local ancestor = item:FindFirstAncestorOfClass("Model")
+		while ancestor do
+			if ancestor:FindFirstChildOfClass("Humanoid") then
+				return ancestor
+			end
+			ancestor = ancestor:FindFirstAncestorOfClass("Model")
+		end
+	end
+
+	if state.rig and state.rig.Parent then
+		return state.rig
+	end
+
+	local fallback = workspace:FindFirstChild("Rig")
+	if fallback and fallback:IsA("Model") and fallback:FindFirstChildOfClass("Humanoid") then
+		return fallback
+	end
+
+	return nil
+end
+
+-- ============================================================
+-- Статус
+-- ============================================================
+local function updateFrames()
+	if GlobalFrame then
+		pcall(function()
+			GlobalFrame.Visible = state.active
+			local label = GlobalFrame:FindFirstChild("Label")
+			if label then
+				label.Text = state.active and "Live Bone IK (Moon)" or ""
+			end
+		end)
+	end
+
+	if LocalFrame then
+		pcall(function()
+			LocalFrame.Visible = state.rig ~= nil
+			local label = LocalFrame:FindFirstChild("Label")
+			if label and state.rig then
+				label.Text = state.active
+					and "IK active: animate targets in MoonAnimator"
+					or "IK inactive"
+				label.TextColor3 = state.active
+					and Color3.fromRGB(85, 187, 255)
+					or Color3.fromRGB(255, 64, 64)
+			end
+		end)
+	end
+end
+
+local function setToggleActive(active)
+	pcall(function()
+		ToolController:UpdateToolButton(active)
+	end)
+end
+
+-- ============================================================
+-- Запись поз костей
+-- ============================================================
+local function cframesDiffer(a, b)
+	if not a or not b then
+		return true
+	end
+
+	local ac = { a:GetComponents() }
+	local bc = { b:GetComponents() }
+
+	for index = 1, 12 do
+		if math.abs(ac[index] - bc[index]) > 0.0005 then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function samplesDiffer(a, b)
+	if not a or not b then
+		return true
+	end
+
+	for name, value in a do
+		if cframesDiffer(value, b[name]) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function recordSample(rig)
+	if not recorder.active then
 		return
 	end
-	
-	if totalActive == 0 then
-		LocalStatusFrame.Label.Text = `Selected Rig(s) are Inactive`
-		LocalStatusFrame.Label.TextColor3 = Color3.fromRGB(255, 64, 64)
-	elseif totalActive == totalRigs then
-		LocalStatusFrame.Label.Text = `Selected Rig(s) are Active`
-		LocalStatusFrame.Label.TextColor3 = Color3.fromRGB(85, 187, 255)
-	else
-		LocalStatusFrame.Label.Text = ""
+
+	local elapsed = os.clock() - recorder.startClock
+
+	if elapsed >= RECORD_LIMIT then
+		recorder.active = false
+		recordButton:SetActive(false)
+		warn("[IK Toggle] лимит записи " .. RECORD_LIMIT .. " сек")
+		return
 	end
 
-	LocalStatusFrame.Visible = true
+	if elapsed - recorder.lastSample < (1 / RECORD_FPS) - 0.0001 then
+		return
+	end
+
+	recorder.lastSample = elapsed
+
+	table.insert(recorder.samples, {
+		time = elapsed,
+		bones = Adapter.GetSample(rig),
+	})
 end
 
+local function startRecording()
+	if not state.active or not state.rig then
+		warn("[IK Toggle] сначала включи Toggle IK")
+		return
+	end
 
-local function DeactivateRig(rig)
-	if not IsRigActive(rig) then return end
-	table.remove(state.activeRigs, table.find(state.activeRigs, rig))
+	Adapter.SolveRig(state.rig)
 
-	if rig and rig.Parent then
-		local ok, err = pcall(RigUtils.ResetRigLegs, rig)
+	recorder.active = true
+	recorder.startClock = os.clock()
+	recorder.lastSample = 0
+	recorder.samples = {
+		{
+			time = 0,
+			bones = Adapter.GetSample(state.rig),
+		},
+	}
+
+	recordButton:SetActive(true)
+
+	print("[IK Toggle] запись началась.")
+	print("  Теперь нажми Play в MoonAnimator и проиграй анимацию таргетов.")
+	print("  После проигрывания нажми Record IK ещё раз и Bake IK.")
+end
+
+local function stopRecording()
+	if not recorder.active then
+		return
+	end
+
+	recorder.active = false
+	recordButton:SetActive(false)
+
+	print("[IK Toggle] запись остановлена. Сэмплов: " .. #recorder.samples)
+end
+
+-- ============================================================
+-- Bake
+-- ============================================================
+local function bakeRecording()
+	stopRecording()
+
+	if #recorder.samples < 2 then
+		warn("[IK Toggle] запись пустая: Toggle IK -> Record IK -> Play в Moon -> Record IK -> Bake IK")
+		return
+	end
+
+	if not state.rig or not state.rig.Parent then
+		warn("[IK Toggle] риг не найден")
+		return
+	end
+
+	local sides = Adapter.GetSides(state.rig)
+	if #sides == 0 then
+		warn("[IK Toggle] адаптер не нашёл ноги")
+		return
+	end
+
+	local sequence = Instance.new("KeyframeSequence")
+	sequence.Name = "BoneIK_" .. state.rig.Name
+		.. "_" .. tostring(math.floor(os.clock() * 1000))
+	sequence.Loop = false
+	sequence.Priority = Enum.AnimationPriority.Action
+
+	local previous = nil
+	local keysAdded = 0
+
+	for index, sample in recorder.samples do
+		local isLast = index == #recorder.samples
+		local differs = previous == nil or samplesDiffer(previous, sample.bones)
+
+		if differs or isLast then
+			local keyframe = Instance.new("Keyframe")
+			keyframe.Time = sample.time
+
+			local rootPose = Instance.new("Pose")
+			rootPose.Name = "HumanoidRootPart"
+			rootPose.Weight = 1
+			rootPose.CFrame = CFrame.new()
+			rootPose.Parent = keyframe
+
+			for _, side in sides do
+				local thighPose = Instance.new("Pose")
+				thighPose.Name = side.Thigh.Name
+				thighPose.Weight = 1
+				thighPose.CFrame = sample.bones[side.Thigh.Name] or CFrame.new()
+				thighPose.Parent = rootPose
+
+				local kneePose = Instance.new("Pose")
+				kneePose.Name = side.Knee.Name
+				kneePose.Weight = 1
+				kneePose.CFrame = sample.bones[side.Knee.Name] or CFrame.new()
+				kneePose.Parent = thighPose
+			end
+
+			keyframe.Parent = sequence
+			keysAdded += 1
+		end
+
+		previous = sample.bones
+	end
+
+	local folder = ReplicatedStorage:FindFirstChild("BoneIK_Recordings")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "BoneIK_Recordings"
+		folder.Parent = ReplicatedStorage
+	end
+
+	sequence.Parent = folder
+
+	pcall(function()
+		SelectionService:Set({ sequence })
+	end)
+
+	print("==============================================")
+	print("[IK Toggle] сохранено: " .. sequence:GetFullName())
+	print(string.format(
+		"  ключей: %d, длительность: %.2f сек",
+		keysAdded,
+		recorder.samples[#recorder.samples].time
+		))
+	print("  Импорт в MoonAnimator как вторая анимация:")
+	print("  Save to Roblox -> Animation ID -> Moon Import -> Animation ID.")
+	print("==============================================")
+end
+
+-- ============================================================
+-- Live IK: PreRender + Heartbeat
+-- ============================================================
+local function tickSolve()
+	if not state.active then
+		return
+	end
+
+	if not state.rig or not state.rig.Parent then
+		return
+	end
+
+	Adapter.SolveRig(state.rig)
+	recordSample(state.rig)
+end
+
+local function connectSolvers()
+	state.heartbeat = RunService.Heartbeat:Connect(tickSolve)
+	state.render = nil
+
+	local preRenderOk = pcall(function()
+		state.render = RunService.PreRender:Connect(tickSolve)
+	end)
+
+	if not preRenderOk or not state.render then
+		pcall(function()
+			state.render = RunService.RenderStepped:Connect(tickSolve)
+		end)
+	end
+
+	print("[IK Toggle] solvers: Heartbeat"
+		.. (state.render and " + PreRender/RenderStepped" or ""))
+end
+
+local function disconnectSolvers()
+	if state.heartbeat then
+		state.heartbeat:Disconnect()
+		state.heartbeat = nil
+	end
+
+	if state.render then
+		state.render:Disconnect()
+		state.render = nil
+	end
+end
+
+-- ============================================================
+-- IK вкл/выкл
+-- ============================================================
+local function stopIK(restore)
+	disconnectSolvers()
+	stopRecording()
+
+	if restore ~= false and state.rig and state.rig.Parent then
+		pcall(Adapter.Restore, state.rig)
+	end
+
+	state.active = false
+	updateFrames()
+	setToggleActive(false)
+end
+
+local function startIK(rig)
+	stopIK(true)
+
+	local ok, message = Adapter.EnsureControls(rig)
+
+	if not ok then
+		warn("[IK Toggle] " .. tostring(message))
+		return false
+	end
+
+	Adapter.Bind(rig)
+
+	local sides = Adapter.GetSides(rig)
+	if #sides == 0 then
+		warn("[IK Toggle] адаптер не нашёл ноги")
+		return false
+	end
+
+	state.rig = rig
+	state.active = true
+
+	Adapter.SolveRig(rig)
+	connectSolvers()
+
+	updateFrames()
+	setToggleActive(true)
+
+	print("[IK Toggle] live IK включён: " .. rig:GetFullName())
+
+	for _, side in sides do
+		print(string.format(
+			"  %s / %s -> %s",
+			side.Thigh.Name,
+			side.Knee.Name,
+			side.Target and side.Target.Name or "MISSING"
+			))
+	end
+
+	print("  Управление: двигай RightLegTarget / LeftLegTarget в MoonAnimator.")
+	print("  Кости в Moon не добавляй, иначе Moon перезапишет IK.")
+
+	return true
+end
+
+-- ============================================================
+-- Выделение таргетов для MoonAnimator
+-- ============================================================
+local function selectIkParts()
+	if not Adapter then
+		warn("[IK Toggle] Utils/BoneLegAdapter не загружен")
+		return
+	end
+
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели риг")
+		return
+	end
+
+	if not state.active then
+		local ok = startIK(rig)
 		if not ok then
-			---warn("Reset failed: " .. tostring(err))
+			return
 		end
 	end
 
-	UpdateLocalStatus()
-end
+	local targets = {}
+	local config = Adapter.Config
 
-local function ActivateRig(rig)
-	if IsRigActive(rig) then return end
-	table.insert(state.activeRigs, rig)
-	UpdateLocalStatus()
-end
+	for _, name in { "Right", "Left" } do
+		local targetName = config.Targets[name]
+		local part = rig:FindFirstChild(targetName)
+		if part and part:IsA("BasePart") then
+			table.insert(targets, part)
+		end
+	end
 
------------------------------------------------------
---- IK Update Functions
-
-local Logger = global.classes.Logger
-
-local function IKRigUpdate_R6(Rig)
-	if not Rig or not Rig.Parent then
+	if #targets == 0 then
+		warn("[IK Toggle] таргеты не созданы")
 		return
 	end
 
-	local LeftRoot = Rig:FindFirstChild("LeftLegRoot")
-	local LeftTarget = Rig:FindFirstChild("LeftLegTarget")
-	local LeftLeg = Rig:FindFirstChild("LeftLeg")
+	SelectionService:Set(targets)
 
-	local RightRoot = Rig:FindFirstChild("RightLegRoot")
-	local RightTarget = Rig:FindFirstChild("RightLegTarget")
-	local RightLeg = Rig:FindFirstChild("RightLeg")
-
-	local success, err = pcall(function()
-		if LeftRoot and LeftTarget and LeftLeg then
-			LeftLeg.CFrame = IkCalc.CalcR6(LeftRoot.CFrame, LeftTarget.CFrame * CFrame.new(0, -LeftTarget.Size.Y/2, 0), LeftLeg.Size.Y)
-		end
-
-		if RightRoot and RightTarget and RightLeg then
-			RightLeg.CFrame = IkCalc.CalcR6(RightRoot.CFrame, RightTarget.CFrame * CFrame.new(0, -RightTarget.Size.Y/2, 0), RightLeg.Size.Y)
-		end
-	end)
-
-	if not success then
-		Logger.Warn(`IK Update failed for Rig {Rig.Name}: {err}`)
-		DeactivateRig(Rig)
+	print("==============================================")
+	print("[IK Toggle] выделены таргеты IK:")
+	for _, part in targets do
+		print("  " .. part:GetFullName())
 	end
+	print("")
+	print("  Дальше в MoonAnimator:")
+	print("  1. Нажми Add Item / 9 и добавь оба выделенных таргета.")
+	print("  2. У таргетов появится CFrame-трек.")
+	print("  3. Двигай таргеты и ставь ключи (+) на нужных кадрах.")
+	print("  4. Кости и сам Rig в Moon не добавляй.")
+	print("  5. Во время Play плагин сам держит IK-позу.")
+	print("==============================================")
 end
 
-
-
-local function IKRigUpdate_R15(Rig)
-	if not Rig or not Rig.Parent then
-		return
-	end
-
-	local LeftRoot = Rig:FindFirstChild("LeftLegRoot")
-	local LeftTarget = Rig:FindFirstChild("LeftLegTarget")
-	local LeftHip = Rig:FindFirstChild("LeftUpperLeg")
-	local LeftLeg = Rig:FindFirstChild("LeftLowerLeg")
-	local LeftFoot = Rig:FindFirstChild("LeftFoot")
-
-	local RightRoot = Rig:FindFirstChild("RightLegRoot")
-	local RightTarget = Rig:FindFirstChild("RightLegTarget")
-	local RightHip = Rig:FindFirstChild("RightUpperLeg")
-	local RightLeg = Rig:FindFirstChild("RightLowerLeg")
-	local RightFoot = Rig:FindFirstChild("RightFoot")
-	
-	local lJoints, rJoints = RigUtils.GetIkJointsR15(Rig, true)
-	local RightLength, LeftLength = RigUtils.CalcLegLengthR15(Rig)
-	
-	local success, err = pcall(function()
-		if LeftRoot and LeftTarget and LeftHip and LeftLeg and LeftFoot then
-			local L1, L2 = LeftLength.L1, LeftLength.L2
-			LeftHip.CFrame, LeftLeg.CFrame, LeftFoot.CFrame = 
-				IkCalc.CalcR15(LeftRoot.CFrame, LeftTarget.CFrame * CFrame.new(0, -LeftTarget.Size.Y/2, 0), lJoints, L1, L2, LeftFoot.Size.Y)
-		end
-
-		if RightRoot and RightTarget and RightHip and RightLeg and RightFoot then
-			local L1, L2 = RightLength.L1, RightLength.L2
-			RightHip.CFrame, RightLeg.CFrame, RightFoot.CFrame = 
-				IkCalc.CalcR15(RightRoot.CFrame, RightTarget.CFrame * CFrame.new(0, -RightTarget.Size.Y/2, 0), rJoints, L1, L2, RightFoot.Size.Y)
-		end
-	end)
-
-	if not success then
-		DeactivateRig(Rig)
-		Logger.Warn(`Failed to solve IK for Rig {Rig.Name}: {err}`)
-	end
-end
-
-
------------------------------------------------------
-
-local function DisconnectIK()
-	if state.ikConnection then
-		state.ikConnection:Disconnect()
-		state.ikConnection = nil
-	end
-	state.ikActive = false
-	GlobalStatusFrame.Visible = false
-end
-local function IKRigUpdate_BONES(rig)
-	local success, err = pcall(function()
-		BoneLegAdapter.SolveRig(rig, rig:GetPivot().RightVector)
-	end)
-
-	if not success then
-		Logger.Warn("Bone IK update failed for " .. rig.Name .. ": " .. tostring(err))
-		DeactivateRig(rig)
-	end
-end
-
-local function ConnectIK()
-	state.ikActive = true
-	GlobalStatusFrame.Visible = true
-	
-	local connection = nil
-	state.ikConnection = game["Run Service"].Heartbeat:Connect(function()
-		if state == nil or global == nil then
-			if connection then
-				connection:Disconnect()
-				connection = nil
-			end
-			return
-		end
-		if #state.activeRigs == 0 or not state.ikActive then
-			for _, rig in state.activeRigs do
-				DeactivateRig(rig)
-			end
-			DisconnectIK()
-			return
-		end
-		
-		for _, rig in state.activeRigs do
-			if not rig or not rig.Parent then
-				DeactivateRig(rig)
-				continue
-			end
-
-			if BoneLegAdapter.IsBoneLegRig(rig) then
-				IKRigUpdate_BONES(rig)
-				continue
-			end
-
-			local rigType = RigUtils.GetRigType(rig)
-			if rigType == "R15" then
-				IKRigUpdate_R15(rig)
-			elseif rigType == "R6" then
-				IKRigUpdate_R6(rig)
-			end
-		end
-	end)
-	connection = state.ikConnection
-end
-
-
-
-
-
-
-
-
-
+-- ============================================================
+-- Кнопки
+-- ============================================================
 ToolController:BindToolButton(function()
-	-- 1. AUTO-SETUP: создаёт таргеты/руты/тег, если их нет
-	local setupOk = {}
-
-	for _, result in IkAutoSetup.EnsureSelection() do
-		setupOk[result.rig] = result.ok
-		if result.ok then
-			print("[IK AutoSetup] " .. result.rig.Name .. ": " .. result.message)
-		else
-			Logger.Warn("[IK AutoSetup] " .. result.rig.Name .. ": " .. result.message)
-		end
+	if not Adapter then
+		warn("[IK Toggle] Utils/BoneLegAdapter не загружен")
+		return false
 	end
 
-	-- 2. Собираем список вручную: риг без тега не виден GetSelectedRigs()
-	local selectedRigs = {}
+	local rig = getRig()
 
-	for _, item in Selection.Get() do
-		if not item:IsA("Model") then
-			continue
-		end
-
-		if BoneLegAdapter.IsBoneLegRig(item) then
-			-- включаем только если Ensure прошёл успешно
-			if setupOk[item] == true then
-				table.insert(selectedRigs, item)
-			end
-			continue
-		end
-
-		if RigUtils.ValidateRigWithIK(item) then
-			table.insert(selectedRigs, item)
-		end
+	if not rig then
+		warn("[IK Toggle] выдели риг в Explorer (Model с Humanoid)")
+		return false
 	end
 
-	if #selectedRigs == 0 then
-		Logger.Warn("Select a bone rig (Humanoid + thigh/knee) or an IK rig in Workspace")
-		return
+	if state.active and state.rig == rig then
+		stopIK(true)
+		print("[IK Toggle] IK выключен, bind-поза восстановлена")
+		return false
 	end
 
-	-- 3. ОРИГИНАЛЬНАЯ ЛОГИКА АКТИВАЦИИ (её нельзя терять)
-	local totalActive, totalRigs = 0, #selectedRigs
-
-	for _, rig in selectedRigs do
-		if IsRigActive(rig) then
-			totalActive += 1
-		end
-	end
-
-	if totalRigs == totalActive then
-		for _, rig in selectedRigs do
-			DeactivateRig(rig)
-		end
-		return
-	end
-
-	for _, rig in selectedRigs do
-		ActivateRig(rig)
-	end
-
-	if #state.activeRigs > 0 then
-		ConnectIK()
-	end
+	return startIK(rig)
 end, false)
 
-
-ToolController:RegisterUpdater(Selection.SelectionChanged, UpdateLocalStatus)
-
-
-ToolController:RegisterEvent(collectionService:GetInstanceRemovedSignal(IKRig_Tag), function(rig)
-	DeactivateRig(rig)
+selectButton.Click:Connect(function()
+	selectIkParts()
 end)
 
+recordButton.Click:Connect(function()
+	if not Adapter then
+		return
+	end
 
-ToolController:RegisterEvent(guiUtil.GetButton("globalStatus").Click, function()
-	Selection.Set(state.activeRigs)
+	if recorder.active then
+		stopRecording()
+	else
+		startRecording()
+	end
 end)
 
+bakeButton.Click:Connect(function()
+	if not Adapter then
+		return
+	end
+
+	bakeRecording()
+end)
+
+ToolController:RegisterEvent(SelectionService.SelectionChanged, function()
+	updateFrames()
+end)
 
 ToolController:BindToUnload(function()
-	Logger = nil
-	GlobalStatusFrame = nil
-	LocalStatusFrame = nil
-	global = nil
-	toolbar = nil
-	guiUtil = nil
-	RigUtils = nil
-	IkCalc = nil
-	Selection = nil
+	stopIK(false)
+	GlobalFrame = nil
+	LocalFrame = nil
+	Adapter = nil
 	state = nil
+	recorder = nil
 	ToolController = nil
 end)
 

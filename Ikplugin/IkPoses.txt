@@ -46,8 +46,8 @@ function module.BuildRigCache(IKRig, RigType)
 			LeftHip = ikJoints["Left Hip"],
 			RightHip = ikJoints["Right Hip"],
 			
-			LeftLength = IKRig["Left Leg"].Size.Y,
-			RightLength = IKRig["Right Leg"].Size.Y,
+			LeftLength = IKRig["LeftLeg"].Size.Y,
+			RightLength = IKRig["RightLeg"].Size.Y,
 			
 			VirtualRoot = {
 				C0 = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
@@ -152,11 +152,11 @@ function module.BakePoses_R6(Keyframe: Keyframe, IKRig: Model, RigCache)
 	------------------------------------------------------------------------
 	
 	local LeftLegPose = Instance.new("Pose")
-	LeftLegPose.Name = "Left Leg"
+	LeftLegPose.Name = "LeftLeg"
 	LeftLegPose.CFrame = CalcIKPoseCFrame(LeftRootPose, LeftTargetPose, leftRootJoint, leftTargetJoint, LeftHip, LeftLegLength)
 
 	local RightLegPose = Instance.new("Pose")
-	RightLegPose.Name = "Right Leg"
+	RightLegPose.Name = "RightLeg"
 	RightLegPose.CFrame = CalcIKPoseCFrame(RightRootPose, RightTargetPose, rightRootJoint, rightTargetJoint, RightHip, RightLegLength)
 
 	LeftLegPose.Parent = TorsoPose

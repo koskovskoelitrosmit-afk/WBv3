@@ -1,351 +1,724 @@
 --!nonstrict
 --[[
-	BoneLegAdapter  v1.1.0
-	IK Rig Plugin NEW  /  Utils / BoneLegAdapter   (ModuleScript)
+	Utils / BoneLegAdapter  2.0.0-arms
 
-	Bridges the stock R6 leg solver of IK Rig Plugin to a rig whose legs are
-	MeshParts skinned to a two-bone chain:  thigh -> knee.
+	Ноги: RightLegTarget / LeftLegTarget + RightKneePole / LeftKneePole
+	Руки: RightHandTarget / LeftHandTarget + RightElbowPole / LeftElbowPole
 
-	Design rules:
-	  * the MeshPart is never moved, resized, welded, cloned or re-parented;
-	  * legacy hip Motor6Ds are never removed or rewritten;
-	  * only Bone.Transform is written for the thigh and the knee;
-	  * every frame is solved in the mesh bind space, so moving the whole rig
-	    does not accumulate drift.
-
-	1.1.0:
-	  * robust lookups for a nested Torso Model / HumanoidRootPart
-	  * automatic thigh + knee detection when a side has custom names
-	  * GetRestPoints() lets Utils/IkAutoSetup place the leg controls
+	Двигаются только Bone.Transform (root и mid кости).
+	MeshPart, Motor6D, WeldConstraint не изменяются.
 ]]
 
 local module = {}
+module.Version = "2.0.0-arms"
 
-module.Version = "1.1.0"
-module.Attribute = "BoneLegIK"
-
--- Names are matched with FindFirstChild(..., true), so bones can live several
--- Levels below the leg model. Change them once here, or call module.Configure.
-local CONFIG = {
+module.Config = {
 	AutoDetect = true,
-	Sides = {
+	BendSign = 1,
+	TargetSize = 0.7,
+	PoleSize = 0.55,
+	TargetColor = {
+		Leg = Color3.fromRGB(196, 241, 90),
+		Arm = Color3.fromRGB(119, 200, 255),
+	},
+	PoleColor = {
+		Leg = Color3.fromRGB(180, 164, 255),
+		Arm = Color3.fromRGB(255, 207, 112),
+	},
+	Tag = "R6IKRig_TAG",
+
+	Legs = {
 		Right = {
-			LegModel = "RightLeg",
+			Root = "RightBoneRoot", Mid = "RightBoneKnee", End = nil,
 			Mesh = "RightLeg_NewMesh",
-			Thigh = "RightBoneRoot",
-			Knee = "RightBoneKnee",
-			Ankle = nil,
-			HipMotor = "Right Hip",
-			Root = "RightLegRoot",
-			Target = "RightLegTarget",
-			ShinLength = nil,
-			BendSign = 1,
+			Target = "RightLegTarget", Pole = "RightKneePole",
+			Length = nil,
 		},
 		Left = {
-			LegModel = "LeftLeg",
+			Root = "LeftLegBoneRoot", Mid = "LeftLegKnee", End = nil,
 			Mesh = "LeftLeg_NewMesh",
-			Thigh = "LeftLegBoneRoot",
-			Knee = "LeftLegKnee",
-			HipMotor = "Left Hip",
-			Root = "LeftLegRoot",
-			Target = "LeftLegTarget",
-			BendSign = 1,
+			Target = "LeftLegTarget", Pole = "LeftKneePole",
+			Length = nil,
+		},
+	},
+
+	Arms = {
+		Right = {
+			Root = nil, Mid = nil, End = nil, Mesh = nil,
+			Target = "RightHandTarget", Pole = "RightElbowPole",
+			Length = nil,
+		},
+		Left = {
+			Root = nil, Mid = nil, End = nil, Mesh = nil,
+			Target = "LeftHandTarget", Pole = "LeftElbowPole",
+			Length = nil,
 		},
 	},
 }
 
-module.Config = CONFIG
+module.Config.Right = module.Config.Legs.Right
+module.Config.Left = module.Config.Legs.Left
+module.Config.Targets = {
+	Right = module.Config.Legs.Right.Target,
+	Left = module.Config.Legs.Left.Target,
+}
 
+local CONFIG = module.Config
 local cache = setmetatable({}, { __mode = "k" })
 
-local function findNamed(parent, name, className)
-	if parent == nil or name == nil or name == "" then
-		return nil
-	end
-	if parent.Name == name and (className == nil or parent:IsA(className)) then
-		return parent
-	end
-	for _, descendant in parent:GetDescendants() do
-		if descendant.Name == name and (className == nil or descendant:IsA(className)) then
-			return descendant
-		end
-	end
-	return nil
+local LEG_ROOT_HINTS = { "thigh", "upper", "hip", "femur", "root" }
+local LEG_MID_HINTS = { "knee", "shin", "lower", "calf", "tibia" }
+local LEG_END_HINTS = { "ankle", "foot", "toe" }
+
+local ARM_ROOT_HINTS = { "shoulder", "upper", "arm", "root" }
+local ARM_MID_HINTS = { "elbow", "forearm", "lower", "arm" }
+local ARM_END_HINTS = { "hand", "wrist", "palm", "finger" }
+
+local LEG_WORDS = { "leg", "thigh", "knee", "shin", "foot", "ankle", "calf" }
+local ARM_WORDS = { "arm", "shoulder", "elbow", "forearm", "wrist", "hand" }
+
+local function lower(text)
+	return string.lower(text)
 end
 
-local function getMeshPart(bone)
-	local current = bone.Parent
-	while current ~= nil do
-		if current:IsA("BasePart") then
-			return current
-		end
-		current = current.Parent
-	end
-	return nil
-end
-
-local function findBasePart(parent, name)
-	if parent == nil or name == nil then
-		return nil
-	end
-	local direct = parent:FindFirstChild(name)
-	if direct ~= nil and direct:IsA("BasePart") then
-		return direct
-	end
-	-- Torso can be a Model and HumanoidRootPart can live inside it.
-	for _, descendant in parent:GetDescendants() do
-		if descendant.Name == name and descendant:IsA("BasePart") then
-			return descendant
-		end
-	end
-	return nil
-end
-
-function module.GetTorso(rig)
-	return findBasePart(rig, "Torso")
-		or findBasePart(rig, "UpperTorso")
-		or findBasePart(rig, "LowerTorso")
-		or module.GetRootPart(rig)
-		or rig:FindFirstChildWhichIsA("BasePart", true)
-end
-
-function module.GetRootPart(rig)
-	local humanoid = rig:FindFirstChildOfClass("Humanoid")
-	if humanoid ~= nil and humanoid.RootPart ~= nil then
-		return humanoid.RootPart
-	end
-	return findBasePart(rig, "HumanoidRootPart") or rig.PrimaryPart
-end
-
-local function getTorso(rig)
-	return module.GetTorso(rig)
-end
-
-local ROOT_HINTS = { "thigh", "upper", "root", "hip", "femur" }
-local KNEE_HINTS = { "knee", "shin", "lower", "calf", "tibia" }
-
-local function containsAny(name, hints)
-	local lower = string.lower(name)
+local function containsAny(text, hints)
 	for _, hint in hints do
-		if string.find(lower, hint, 1, true) ~= nil then
+		if string.find(text, hint, 1, true) then
 			return true
 		end
 	end
 	return false
 end
 
-local function collectBones(container)
-	local entries = {}
-	for _, descendant in container:GetDescendants() do
+local function strContains(text, word)
+	return string.find(text, word, 1, true) ~= nil
+end
+
+local function unit(vector)
+	if not vector or vector.Magnitude < 0.0001 then
+		return nil
+	end
+	return vector.Unit
+end
+
+local function safeWarn(message)
+	warn("[BoneLegAdapter] " .. tostring(message))
+end
+
+local function getRoot(rig)
+	local humanoid = rig:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.RootPart then
+		return humanoid.RootPart
+	end
+	if rig.PrimaryPart then
+		return rig.PrimaryPart
+	end
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant.Name == "HumanoidRootPart" then
+			return descendant
+		end
+	end
+	return rig:FindFirstChildWhichIsA("BasePart", true)
+end
+module.GetRootPart = getRoot
+
+local function allBones(rig)
+	local list = {}
+	for _, descendant in rig:GetDescendants() do
 		if descendant:IsA("Bone") then
-			local depth, current = 0, descendant.Parent
-			while current ~= nil and current ~= container do
-				depth += 1
-				current = current.Parent
-			end
-			table.insert(entries, { Bone = descendant, Depth = depth })
+			table.insert(list, descendant)
 		end
 	end
-	table.sort(entries, function(a, b)
-		return a.Depth < b.Depth
-	end)
-	return entries
+	return list
 end
 
--- Used when the left leg uses names other than LeftBoneRoot / LeftBoneKnee.
-local function guessChain(rig, sideName, config)
-	if not CONFIG.AutoDetect then
+local function findBone(rig, name)
+	if not name or name == "" then
 		return nil
 	end
-
-	local sideWord = string.lower(sideName)
-	local scoped = config.LegModel and findNamed(rig, config.LegModel)
-	local container = scoped or rig
-	local entries = collectBones(container)
-	local sideFiltered = scoped == nil
-
-	-- If the leg model has no bones at all, search the whole rig but only
-	-- accept chain names that mention this side. This avoids reusing the
-	-- right chain for the left side.
-	if #entries == 0 and container ~= rig then
-		container = rig
-		entries = collectBones(rig)
-		sideFiltered = true
-	end
-	if #entries == 0 then
-		return nil
-	end
-
-	local bestThigh, bestKnee, bestScore = nil, nil, -1
-
-	for _, entry in entries do
-		local bone = entry.Bone
-		for _, child in bone:GetChildren() do
-			if child:IsA("Bone") then
-				local hasSideName = string.find(string.lower(bone.Name), sideWord, 1, true)
-					or string.find(string.lower(child.Name), sideWord, 1, true)
-				local score = 0
-				if sideFiltered and not hasSideName then
-					score = -100
-				end
-				if containsAny(bone.Name, ROOT_HINTS) then score += 3 end
-				if containsAny(child.Name, KNEE_HINTS) then score += 3 end
-				if hasSideName then score += 2 end
-				if string.find(string.lower(child.Name), sideWord, 1, true) then score += 2 end
-				if entry.Depth == 0 then score += 1 end
-				if score > bestScore then
-					bestScore, bestThigh, bestKnee = score, bone, child
-				end
-			end
+	for _, bone in allBones(rig) do
+		if bone.Name == name then
+			return bone
 		end
 	end
-
-	return bestThigh, bestKnee
+	return nil
 end
 
-local function resolveSide(rig, sideName, config)
-	local guessed = false
-	local thigh = findNamed(rig, config.Thigh, "Bone")
-	local knee = thigh and findNamed(thigh, config.Knee, "Bone")
+local function pathText(bone, depth)
+	local parts = {}
+	local current = bone
+	local count = 0
 
-	if thigh == nil or knee == nil then
-		local guessedThigh, guessedKnee = guessChain(rig, sideName, config)
-		if thigh == nil and guessedThigh ~= nil then
-			thigh = guessedThigh
-			guessed = true
+	while current and count < (depth or 4) do
+		table.insert(parts, lower(current.Name))
+		current = current.Parent
+		count += 1
+	end
+
+	return table.concat(parts, "/")
+end
+
+local function regionOf(bone)
+	local current = bone
+	local count = 0
+
+	while current and count < 6 do
+		local text = lower(current.Name)
+		if containsAny(text, ARM_WORDS) then
+			return "Arm"
 		end
-		if knee == nil and guessedKnee ~= nil then
-			knee = guessedKnee
-			guessed = true
+		if containsAny(text, LEG_WORDS) then
+			return "Leg"
+		end
+		current = current.Parent
+		count += 1
+	end
+
+	return nil
+end
+
+local function sideOf(bone)
+	local current = bone
+	local count = 0
+
+	while current and count < 5 do
+		local text = lower(current.Name)
+		if strContains(text, "right") then
+			return "Right"
+		end
+		if strContains(text, "left") then
+			return "Left"
+		end
+		current = current.Parent
+		count += 1
+	end
+
+	return nil
+end
+
+local function findMesh(rig, bone, config)
+	local current = bone.Parent
+	while current do
+		if current:IsA("MeshPart") then
+			return current
+		end
+		if current:IsA("BasePart") then
+			local nested = current:FindFirstChildWhichIsA("MeshPart", true)
+			if nested then
+				return nested
+			end
+		end
+		current = current.Parent
+	end
+
+	if config and config.Mesh then
+		local named = rig:FindFirstChild(config.Mesh, true)
+		if named and named:IsA("MeshPart") then
+			return named
 		end
 	end
 
-	if thigh == nil or knee == nil or thigh == knee then
-		return nil
-	end
+	return nil
+end
 
-	local mesh = getMeshPart(thigh)
-	if mesh == nil and config.Mesh then
-		mesh = findNamed(rig, config.Mesh, "BasePart")
-	end
-	if mesh == nil and config.LegModel then
-		local legModel = findNamed(rig, config.LegModel)
-		if legModel ~= nil then
-			mesh = legModel:FindFirstChildWhichIsA("MeshPart", true)
-				or legModel:FindFirstChildWhichIsA("BasePart", true)
+local function findEndBone(mid, kind)
+	local hints = kind == "Arm" and ARM_END_HINTS or LEG_END_HINTS
+
+	for _, child in mid:GetChildren() do
+		if child:IsA("Bone") and containsAny(lower(child.Name), hints) then
+			return child
 		end
 	end
-	if mesh == nil then
-		return nil
+
+	return nil
+end
+
+local function scorePair(parentBone, childBone, sideName, kind)
+	local region = regionOf(parentBone) or regionOf(childBone)
+	if region and region ~= kind then
+		return -math.huge
 	end
 
-	local hipRest = thigh.WorldCFrame.Position
-	local kneeRest = knee.WorldCFrame.Position
-	local l1 = (kneeRest - hipRest).Magnitude
+	local parentName = lower(parentBone.Name)
+	local childName = lower(childBone.Name)
+	local path = pathText(parentBone, 5) .. "/" .. pathText(childBone, 3)
+	local side = lower(sideName)
 
-	local ankle, ankleRest
-	if config.Ankle then
-		ankle = findNamed(mesh, config.Ankle, "Bone")
-	end
-	if ankle ~= nil then
-		ankleRest = ankle.WorldCFrame.Position
+	local score = region == kind and 20 or 0
+
+	if kind == "Leg" then
+		if containsAny(parentName, LEG_ROOT_HINTS) then score += 8 end
+		if containsAny(childName, LEG_MID_HINTS) then score += 12 end
 	else
-		local shinLength = config.ShinLength
-		if shinLength == nil then
-			-- This rig has no separate ankle bone. The bind-pose mesh height is
-			-- used to reconstruct the shin length. Add an ankle bone (or set
-			-- ShinLength) if the mesh is not authored upright.
-			shinLength = math.max(mesh.Size.Y - l1, 0.2)
-		end
-		local localDown = mesh.CFrame:VectorToWorldSpace(Vector3.new(0, -1, 0))
-		ankleRest = kneeRest + localDown * shinLength
+		if containsAny(parentName, ARM_ROOT_HINTS) then score += 8 end
+		if containsAny(childName, ARM_MID_HINTS) then score += 12 end
 	end
 
-	local l2 = (ankleRest - kneeRest).Magnitude
-	if l1 < 0.01 or l2 < 0.01 then
+	if strContains(path, side) then score += 6 end
+	if strContains(parentName, side) then score += 4 end
+	if strContains(childName, side) then score += 4 end
+	if parentBone.Parent and parentBone.Parent:IsA("BasePart") then score += 2 end
+
+	return score
+end
+
+local function detectChain(rig, sideName, kind, claimed, warnings)
+	local candidates = {}
+
+	for _, parentBone in allBones(rig) do
+		for _, child in parentBone:GetChildren() do
+			if child:IsA("Bone") then
+				local score = scorePair(parentBone, child, sideName, kind)
+				if score > 8 then
+					table.insert(candidates, {
+						Root = parentBone,
+						Mid = child,
+						Score = score,
+						Path = pathText(parentBone, 5),
+					})
+				end
+			end
+		end
+	end
+
+	table.sort(candidates, function(a, b)
+		return a.Score > b.Score
+	end)
+
+	for _, candidate in candidates do
+		if not claimed[candidate.Root] and not claimed[candidate.Mid] then
+			if strContains(lower(candidate.Path), lower(sideName)) then
+				claimed[candidate.Root] = kind
+				claimed[candidate.Mid] = kind
+				return candidate.Root, candidate.Mid
+			end
+		end
+	end
+
+	for _, candidate in candidates do
+		if not claimed[candidate.Root] and not claimed[candidate.Mid] then
+			claimed[candidate.Root] = kind
+			claimed[candidate.Mid] = kind
+			return candidate.Root, candidate.Mid
+		end
+	end
+
+	local bones = {}
+	for _, bone in allBones(rig) do
+		table.insert(bones, bone:GetFullName())
+	end
+
+	table.insert(
+		warnings,
+		string.format(
+			"%s %s: не найдена цепочка. Кости рига: %s",
+			kind,
+			sideName,
+			#bones > 0 and table.concat(bones, ", ") or "НЕТ"
+		)
+	)
+
+	return nil
+end
+
+local function estimateLength(mesh, rootPosition, midPosition, direction)
+	local localAxis = mesh.CFrame:VectorToObjectSpace(direction)
+	local half = (
+		math.abs(localAxis.X) * mesh.Size.X
+			+ math.abs(localAxis.Y) * mesh.Size.Y
+			+ math.abs(localAxis.Z) * mesh.Size.Z
+	) * 0.5
+
+	local centerProjection = (mesh.CFrame.Position - rootPosition):Dot(direction)
+	local midProjection = (midPosition - rootPosition):Dot(direction)
+	local farProjection = centerProjection + half
+
+	return math.max(farProjection - midProjection, 0.2)
+end
+
+local function captureChain(rig, sideName, kind, config, claimed, warnings)
+	local root = findBone(rig, config.Root)
+	local mid = findBone(rig, config.Mid)
+
+	if not root or not mid then
+		local detectedRoot, detectedMid = detectChain(rig, sideName, kind, claimed, warnings)
+		root = root or detectedRoot
+		mid = mid or detectedMid
+	end
+
+	if not root or not mid then
 		return nil
 	end
+
+	claimed[root] = claimed[root] or kind
+	claimed[mid] = claimed[mid] or kind
+
+	local mesh = findMesh(rig, root, config)
+	if not mesh then
+		table.insert(warnings, kind .. " " .. sideName .. ": не найден MeshPart для костей")
+		return nil
+	end
+
+	local savedRoot = root.Transform
+	local savedMid = mid.Transform
+	root.Transform = CFrame.new()
+	mid.Transform = CFrame.new()
+
+	local rootWorld = root.WorldCFrame
+	local midWorld = mid.WorldCFrame
+	local rootPosition = rootWorld.Position
+	local midPosition = midWorld.Position
+	local l1 = (midPosition - rootPosition).Magnitude
+
+	root.Transform = savedRoot
+	mid.Transform = savedMid
+
+	if l1 < 0.01 then
+		table.insert(warnings, kind .. " " .. sideName .. ": длина первой кости 0")
+		return nil
+	end
+
+	local direction = unit(midPosition - rootPosition) or Vector3.new(0, -1, 0)
+	local endBone = findBone(rig, config.End) or findEndBone(mid, kind)
+	local endPosition
+	local l2
+
+	if endBone then
+		endPosition = endBone.WorldCFrame.Position
+		l2 = (endPosition - midPosition).Magnitude
+	else
+		l2 = config.Length or estimateLength(mesh, rootPosition, midPosition, direction)
+		endPosition = midPosition + direction * l2
+	end
+
+	if l2 < 0.01 then
+		table.insert(warnings, kind .. " " .. sideName .. ": длина второй кости 0")
+		return nil
+	end
+
+	local meshCFrame = mesh.CFrame
 
 	return {
-		Name = sideName,
-		Config = config,
-		Guessed = guessed,
+		Kind = kind,
+		Side = sideName,
+		Name = sideName .. kind,
+
+		Root = root,
+		Mid = mid,
+		EndBone = endBone,
 		Mesh = mesh,
-		Thigh = thigh,
-		Knee = knee,
-		Ankle = ankle,
+
 		L1 = l1,
 		L2 = l2,
-		BendSign = config.BendSign or 1,
-		MeshRest = mesh.CFrame,
-		HipRest = hipRest,
-		KneeRest = kneeRest,
-		AnkleRestWorld = ankleRest,
-		ThighRestWorld = thigh.WorldCFrame,
-		KneeRestWorld = knee.WorldCFrame,
-		-- The bind pose is Transform = identity. Capturing the current animated
-		-- Transform would restore an animation frame instead of the bind pose.
-		ThighRestTransform = CFrame.new(),
-		KneeRestTransform = CFrame.new(),
-		LastDistance = 0,
-		LastStretch = 0,
-		LastKneeBend = 0,
+
+		LocalRoot = meshCFrame:PointToObjectSpace(rootPosition),
+		LocalMid = meshCFrame:PointToObjectSpace(midPosition),
+		LocalEnd = meshCFrame:PointToObjectSpace(endPosition),
+
+		RootRestRotation = meshCFrame:ToObjectSpace(rootWorld).Rotation,
+		MidRestRotation = meshCFrame:ToObjectSpace(midWorld).Rotation,
+
+		RootBindWorld = rootPosition,
+		MidBindWorld = midPosition,
+		EndBindWorld = endPosition,
+
+		Target = nil,
+		Pole = nil,
 	}
 end
 
-local function bindRig(rig)
-	local sides = {}
-	for sideName, config in CONFIG.Sides do
-		local side = resolveSide(rig, sideName, config)
-		if side ~= nil then
-			sides[sideName] = side
-		end
-	end
+local function bind(rig)
+	local warnings = {}
+	local claimed = {}
+	local chains = {}
+
+	local legRight = captureChain(rig, "Right", "Leg", CONFIG.Legs.Right, claimed, warnings)
+	local legLeft = captureChain(rig, "Left", "Leg", CONFIG.Legs.Left, claimed, warnings)
+
+	if legRight then table.insert(chains, legRight) end
+	if legLeft then table.insert(chains, legLeft) end
+
+	local armRight = captureChain(rig, "Right", "Arm", CONFIG.Arms.Right, claimed, warnings)
+	local armLeft = captureChain(rig, "Left", "Arm", CONFIG.Arms.Left, claimed, warnings)
+
+	if armRight then table.insert(chains, armRight) end
+	if armLeft then table.insert(chains, armLeft) end
 
 	local meta = {
 		Rig = rig,
-		Sides = sides,
-		Enabled = next(sides) ~= nil,
-		BoundAt = os.clock(),
+		Chains = chains,
+		Warnings = warnings,
+		Legs = { Right = legRight, Left = legLeft },
+		Arms = { Right = armRight, Left = armLeft },
+		Enabled = #chains > 0,
 	}
-	cache[rig] = meta
 
-	if meta.Enabled then
-		rig:SetAttribute(module.Attribute, true)
-		rig:SetAttribute("BoneLegAdapter", module.Version)
+	for _, chain in chains do
+		local config = chain.Kind == "Arm" and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
+		chain.Target = rig:FindFirstChild(config.Target)
+		chain.Pole = rig:FindFirstChild(config.Pole)
 	end
 
+	cache[rig] = meta
 	return meta
 end
 
-local function getMeta(rig)
-	return cache[rig] or bindRig(rig)
-end
-
-local function meshDelta(side)
-	local current = side.Mesh.CFrame
-	return current * side.MeshRest:Inverse()
-end
-
-local function parentWorld(bone)
-	local parent = bone.Parent
-	if parent == nil then
+function module.Bind(rig)
+	if not rig or not rig:IsA("Model") then
 		return nil
 	end
-	if parent:IsA("Bone") then
-		return parent.WorldCFrame
-	end
-	return parent.CFrame
+	return cache[rig] or bind(rig)
 end
 
-local function rotationBetween(fromDirection, toDirection)
-	local from = fromDirection.Magnitude > 0.0001 and fromDirection.Unit or Vector3.yAxis
-	local to = toDirection.Magnitude > 0.0001 and toDirection.Unit or Vector3.yAxis
+function module.Rebind(rig)
+	cache[rig] = nil
+	return bind(rig)
+end
+
+function module.IsBoneLegRig(rig)
+	if not rig or not rig:IsA("Model") then
+		return false
+	end
+	if not rig:FindFirstChildOfClass("Humanoid") then
+		return false
+	end
+	return module.Bind(rig).Enabled
+end
+
+function module.Restore(rig)
+	local meta = module.Bind(rig)
+	if not meta then
+		return
+	end
+
+	for _, chain in meta.Chains do
+		if chain.Root.Parent then chain.Root.Transform = CFrame.new() end
+		if chain.Mid.Parent then chain.Mid.Transform = CFrame.new() end
+	end
+end
+
+function module.GetChains(rig)
+	local meta = module.Bind(rig)
+	if not meta then
+		return {}
+	end
+	return meta.Chains
+end
+
+function module.GetSides(rig)
+	local list = {}
+	for _, chain in module.GetChains(rig) do
+		table.insert(list, {
+			Name = chain.Name,
+			Kind = chain.Kind,
+			Side = chain.Side,
+			Thigh = chain.Root,
+			Knee = chain.Mid,
+			Mesh = chain.Mesh,
+			Target = chain.Target,
+			Pole = chain.Pole,
+			L1 = chain.L1,
+			L2 = chain.L2,
+		})
+	end
+	return list
+end
+
+function module.GetTargets(rig)
+	local list = {}
+	local seen = {}
+
+	for _, chain in module.GetChains(rig) do
+		for _, part in { chain.Target, chain.Pole } do
+			if part and part:IsA("BasePart") and not seen[part] then
+				seen[part] = true
+				table.insert(list, part)
+			end
+		end
+	end
+
+	return list
+end
+
+local function addLabel(part)
+	if part:FindFirstChild("BoneIKLabel") then
+		return
+	end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "BoneIKLabel"
+	billboard.AlwaysOnTop = true
+	billboard.Size = UDim2.fromOffset(190, 26)
+	billboard.StudsOffset = Vector3.new(0, 0.75, 0)
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.Code
+	label.TextScaled = true
+	label.TextColor3 = part.Color
+	label.TextStrokeColor3 = Color3.new()
+	label.TextStrokeTransparency = 0.4
+	label.Text = part.Name
+	label.Parent = billboard
+
+	billboard.Parent = part
+end
+
+local function ensureControl(rig, name, position, color, size, shape)
+	local existing = rig:FindFirstChild(name)
+
+	if existing then
+		if not existing:IsA("BasePart") then
+			return nil, name .. " занято объектом " .. existing.ClassName
+		end
+		existing.Anchored = true
+		existing.CanCollide = false
+		existing.CanTouch = false
+		existing.CanQuery = false
+		existing.CastShadow = false
+		existing.Massless = true
+		return existing
+	end
+
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Shape = shape or Enum.PartType.Ball
+	part.Size = Vector3.new(size, size, size)
+	part.Material = Enum.Material.Neon
+	part.Color = color
+	part.Transparency = 0.15
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Massless = true
+	part.Locked = false
+	part.CFrame = CFrame.new(position)
+	part.Parent = rig
+	addLabel(part)
+
+	return part
+end
+
+function module.EnsureControls(rig)
+	if not rig or not rig:IsA("Model") then
+		return false, "выделен не Model"
+	end
+	if not rig:FindFirstChildOfClass("Humanoid") then
+		return false, "в риге нет Humanoid"
+	end
+
+	local meta = module.Rebind(rig)
+	if not meta.Enabled then
+		return false, "кости не найдены. " .. table.concat(meta.Warnings, " | ")
+	end
+
+	module.Restore(rig)
+
+	local rootPart = getRoot(rig)
+	local forward = rootPart and rootPart.CFrame.LookVector or Vector3.new(0, 0, -1)
+	local rightVector = rootPart and rootPart.CFrame.RightVector or Vector3.new(1, 0, 0)
+	local created = 0
+
+	for _, chain in meta.Chains do
+		local isArm = chain.Kind == "Arm"
+		local config = isArm and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
+
+		local target, targetError = ensureControl(
+			rig,
+			config.Target,
+			chain.EndBindWorld,
+			isArm and CONFIG.TargetColor.Arm or CONFIG.TargetColor.Leg,
+			CONFIG.TargetSize
+		)
+
+		if not target then
+			return false, targetError
+		end
+
+		local sideSign = chain.Side == "Right" and 1 or -1
+		local polePosition
+
+		if isArm then
+			polePosition = chain.MidBindWorld
+			- forward * math.max(chain.L1 * 0.7, 0.5)
+				+ rightVector * (sideSign * math.max(chain.L1 * 0.35, 0.3))
+		else
+			polePosition = chain.MidBindWorld
+				+ forward * math.max(chain.L1 * 0.7, 0.5)
+		end
+
+		local pole, poleError = ensureControl(
+			rig,
+			config.Pole,
+			polePosition,
+			isArm and CONFIG.PoleColor.Arm or CONFIG.PoleColor.Leg,
+			CONFIG.PoleSize,
+			Enum.PartType.Cylinder
+		)
+
+		if not pole then
+			return false, poleError
+		end
+
+		if not chain.Target then created += 1 end
+		if not chain.Pole then created += 1 end
+
+		chain.Target = target
+		chain.Pole = pole
+	end
+
+	local tag = CONFIG.Tag
+	if shared._IKRigGlobal and shared._IKRigGlobal.IKRig_Tag then
+		tag = shared._IKRigGlobal.IKRig_Tag
+	end
+
+	if not rig:HasTag(tag) then
+		rig:AddTag(tag)
+	end
+
+	if not rig.PrimaryPart and rootPart then
+		rig.PrimaryPart = rootPart
+	end
+
+	rig:SetAttribute("BoneIKReady", true)
+
+	print("[Bone IK] контролы готовы, новых объектов: " .. created)
+	for _, chain in meta.Chains do
+		print(string.format(
+			"  %s %s / %s | target=%s | pole=%s",
+			chain.Kind,
+			chain.Root.Name,
+			chain.Mid.Name,
+			chain.Target and chain.Target.Name or "MISSING",
+			chain.Pole and chain.Pole.Name or "MISSING"
+			))
+	end
+
+	for _, warning in meta.Warnings do
+		warn("[Bone IK] " .. warning)
+	end
+
+	return true, "готово: " .. #meta.Chains .. " цепочек"
+end
+
+local function swing(fromDirection, toDirection)
+	local from = unit(fromDirection)
+	local to = unit(toDirection)
+
+	if not from or not to then
+		return CFrame.new()
+	end
+
 	local dot = math.clamp(from:Dot(to), -1, 1)
 
 	if dot > 0.99999 then
 		return CFrame.new()
 	end
+
 	if dot < -0.99999 then
 		local axis = from:Cross(Vector3.xAxis)
 		if axis.Magnitude < 0.0001 then
@@ -353,338 +726,151 @@ local function rotationBetween(fromDirection, toDirection)
 		end
 		return CFrame.fromAxisAngle(axis.Unit, math.pi)
 	end
+
 	return CFrame.fromAxisAngle(from:Cross(to).Unit, math.acos(dot))
 end
 
--- Bone.Transform is a rotation in the bone's local axes applied on top of its
--- rest pose. Convert a world-space delta into those axes; the position stays
--- untouched, so the joint origin never moves.
-local function writeBoneDelta(bone, restWorldRotation, rotationDelta)
-	if bone.Parent == nil then
-		return false
+local function solveChain(rig, chain)
+	local target = chain.Target
+	if not target or not target.Parent then
+		local config = chain.Kind == "Arm" and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
+		target = rig:FindFirstChild(config.Target)
+		chain.Target = target
 	end
-	bone.Transform = restWorldRotation:Inverse() * rotationDelta * restWorldRotation
-	return true
-end
-
--- Public API ---------------------------------------------------------------
-
-function module.Configure(overrides)
-	for sideName, overridesForSide in overrides do
-		local config = CONFIG.Sides[sideName]
-		if config ~= nil then
-			for key, value in overridesForSide do
-				config[key] = value
-			end
-		end
-	end
-	for rig in cache do
-		cache[rig] = nil
-	end
-end
-
-function module.IsBoneLegRig(rig)
-	if rig == nil or not rig:IsA("Model") then
-		return false
-	end
-	if rig:FindFirstChildOfClass("Humanoid") == nil then
-		return false
-	end
-	if rig:GetAttribute(module.Attribute) == false then
-		return false
-	end
-	return getMeta(rig).Enabled
-end
-
-function module.Bind(rig)
-	return getMeta(rig)
-end
-
-function module.Unbind(rig)
-	cache[rig] = nil
-	if rig.Parent ~= nil then
-		rig:SetAttribute(module.Attribute, nil)
-		rig:SetAttribute("BoneLegAdapter", nil)
-	end
-end
-
-function module.Restore(rig)
-	local meta = getMeta(rig)
-	for _, side in meta.Sides do
-		if side.Knee.Parent ~= nil then
-			side.Knee.Transform = side.KneeRestTransform
-		end
-		if side.Thigh.Parent ~= nil then
-			side.Thigh.Transform = side.ThighRestTransform
-		end
-	end
-end
-
-module.Reset = module.Restore
-
-function module.GetLegInfo(rig, sideName)
-	local meta = getMeta(rig)
-	local side = meta.Sides[sideName]
-	if side == nil then
-		return nil
-	end
-	return {
-		L1 = side.L1,
-		L2 = side.L2,
-		Thigh = side.Thigh,
-		Knee = side.Knee,
-		Mesh = side.Mesh,
-	}
-end
-
-function module.GetSideParts(rig)
-	local meta = getMeta(rig)
-	return {
-		LeftLeg = meta.Sides.Left and meta.Sides.Left.Mesh or nil,
-		RightLeg = meta.Sides.Right and meta.Sides.Right.Mesh or nil,
-	}
-end
-
--- World positions of the joints in the current bind pose. Utils/IkAutoSetup
--- uses these points to place leg roots and leg targets automatically.
-function module.GetRestPoints(rig)
-	local meta = getMeta(rig)
-	local points = {}
-	for sideName, side in meta.Sides do
-		local delta = meshDelta(side)
-		points[sideName] = {
-			Hip = (delta * CFrame.new(side.HipRest)).Position,
-			Knee = (delta * side.KneeRestWorld).Position,
-			Ankle = (delta * CFrame.new(side.AnkleRestWorld)).Position,
-			ThighName = side.Thigh.Name,
-			KneeName = side.Knee.Name,
-			MeshName = side.Mesh.Name,
-		}
-	end
-	return points
-end
-
-function module.GetHipOffsets(rig)
-	local meta = getMeta(rig)
-	local torso = getTorso(rig)
-	local offsets = {
-		Left = { X = -0.5, Z = 0 },
-		Right = { X = 0.5, Z = 0 },
-	}
-	if torso == nil then
-		return offsets
+	if not target then
+		return
 	end
 
-	for sideName, side in meta.Sides do
-		local delta = meshDelta(side)
-		local hipNow = delta * CFrame.new(side.HipRest)
-		local localPosition = torso.CFrame:ToObjectSpace(hipNow).Position
-		offsets[sideName] = { X = localPosition.X, Z = localPosition.Z }
-	end
-	return offsets
-end
-
--- Keeps the plugin's IK-control naming. These frames are only used to place
--- visible controls; the actual solve below never touches a Motor6D.
-function module.GetIkJoints(rig, separate)
-	local meta = getMeta(rig)
-	local torso = getTorso(rig)
-	local left, right = {}, {}
-
-	for sideName, side in meta.Sides do
-		local delta = meshDelta(side)
-		local hipNow = delta * CFrame.new(side.HipRest)
-		local hipLocal = torso and torso.CFrame:ToObjectSpace(hipNow).Position
-			or hipNow.Position
-
-		local data = {
-			Hip = {
-				C0 = CFrame.new(hipLocal.X, torso and -torso.Size.Y / 2 or 0, hipLocal.Z),
-				C1 = CFrame.new(0, side.L1, 0),
-			},
-			Knee = {
-				C0 = CFrame.new(0, -side.L2, 0),
-				C1 = CFrame.new(),
-			},
-		}
-
-		if sideName == "Right" then
-			right.Hip = data.Hip
-			right.Knee = data.Knee
-		else
-			left.Hip = data.Hip
-			left.Knee = data.Knee
-		end
+	local pole = chain.Pole
+	if not pole or not pole.Parent then
+		local config = chain.Kind == "Arm" and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
+		pole = rig:FindFirstChild(config.Pole)
+		chain.Pole = pole
 	end
 
-	local rootJoint = {
-		C0 = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
-		C1 = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
-	}
-
-	if separate then
-		return left, right, rootJoint
+	if not chain.Root.Parent or not chain.Mid.Parent or not chain.Mesh.Parent then
+		return
 	end
 
-	local merged = { RootJoint = rootJoint }
-	for name, value in right do
-		merged["Right " .. name] = value
-	end
-	for name, value in left do
-		merged["Left " .. name] = value
-	end
-	return merged
-end
+	local meshCFrame = chain.Mesh.CFrame
+	local rootPosition = meshCFrame:PointToWorldSpace(chain.LocalRoot)
+	local restMid = meshCFrame:PointToWorldSpace(chain.LocalMid)
+	local restEnd = meshCFrame:PointToWorldSpace(chain.LocalEnd)
 
--- Core solve ---------------------------------------------------------------
+	local rootRestRotation = meshCFrame.Rotation * chain.RootRestRotation
+	local midRestRotation = meshCFrame.Rotation * chain.MidRestRotation
 
-function module.SolveSide(side, targetWorld, planeNormal)
-	if side.Thigh.Parent == nil or side.Knee.Parent == nil or side.Mesh.Parent == nil then
-		return nil
+	local l1 = (restMid - rootPosition).Magnitude
+	local l2 = (restEnd - restMid).Magnitude
+
+	if l1 < 0.01 or l2 < 0.01 then
+		return
 	end
 
-	local delta = meshDelta(side)
-	local hip = (delta * CFrame.new(side.HipRest)).Position
-	local kneeRest = (delta * side.KneeRestWorld).Position
-	local ankleRest = (delta * CFrame.new(side.AnkleRestWorld)).Position
-
-	local l1, l2 = side.L1, side.L2
-	local toTarget = targetWorld - hip
+	local toTarget = target.CFrame.Position - rootPosition
 	local rawDistance = toTarget.Magnitude
+
 	if rawDistance < 0.0001 then
-		return nil
+		return
 	end
 
-	local minReach = math.abs(l1 - l2) + 0.001
-	local maxReach = l1 + l2 - 0.001
-	local distance = math.clamp(rawDistance, minReach, maxReach)
-	local direction = toTarget.Unit
+	local direction = toTarget / rawDistance
+	local distance = math.clamp(rawDistance, math.abs(l1 - l2) + 0.001, l1 + l2 - 0.001)
 
-	local normal = planeNormal
-	if normal == nil or normal.Magnitude < 0.0001 then
-		normal = direction:Cross(side.Mesh.CFrame.UpVector)
-	end
-	if normal.Magnitude < 0.0001 then
-		normal = side.Mesh.CFrame.RightVector
-	end
-	normal = normal.Unit
+	local bend = nil
 
-	local bend = normal:Cross(direction)
-	if bend.Magnitude < 0.0001 then
-		bend = side.Mesh.CFrame.RightVector
+	if pole and pole.Parent then
+		local toPole = pole.CFrame.Position - rootPosition
+		bend = toPole - direction * toPole:Dot(direction)
 	end
-	bend = bend.Unit * side.BendSign
+
+	if not bend or bend.Magnitude < 0.001 then
+		local rootPart = getRoot(rig)
+		local fallbackForward = rootPart and rootPart.CFrame.LookVector or meshCFrame.LookVector
+		if chain.Kind == "Arm" then
+			fallbackForward = -fallbackForward
+		end
+		bend = fallbackForward - direction * fallbackForward:Dot(direction)
+	end
+
+	if bend.Magnitude < 0.001 then
+		bend = direction:Cross(Vector3.yAxis)
+	end
+	if bend.Magnitude < 0.001 then
+		bend = meshCFrame.RightVector
+	end
+
+	bend = bend.Unit
 
 	local along = (l1 * l1 - l2 * l2 + distance * distance) / (2 * distance)
 	local height = math.sqrt(math.max(l1 * l1 - along * along, 0))
-	local knee = hip + direction * along + bend * height
-	local ankle = hip + direction * distance
 
-	local baseThighDirection = kneeRest - hip
-	local baseShinDirection = ankleRest - kneeRest
-	local thighDirection = knee - hip
-	local shinDirection = ankle - knee
+	local solvedMid = rootPosition + direction * along + bend * height
+	local solvedEnd = rootPosition + direction * distance
 
-	-- Rotate the thigh from its current bind direction to the solved one.
-	-- Because the joint origin is untouched, the knee lands on the solved point.
-	local thighRestNow = delta * side.ThighRestWorld
-	local thighSwing = rotationBetween(baseThighDirection, thighDirection)
-	writeBoneDelta(side.Thigh, thighRestNow.Rotation, thighSwing)
+	local delta1 = swing(restMid - rootPosition, solvedMid - rootPosition)
 
-	-- The knee inherits the thigh rotation. The shin direction after
-	-- inheritance is thighSwing * baseShinDirection; correct only the
-	-- remaining difference, in the knee's rest axes.
-	local inheritedShinDirection = thighSwing * baseShinDirection
-	local kneeSwing = rotationBetween(inheritedShinDirection, shinDirection)
-	writeBoneDelta(side.Knee, side.KneeRestWorld.Rotation, kneeSwing)
+	chain.Root.Transform =
+		rootRestRotation:Inverse()
+		* delta1
+		* rootRestRotation
 
-	local interior = math.acos(math.clamp(
-		(l1 * l1 + l2 * l2 - distance * distance) / (2 * l1 * l2),
-		-1,
-		1
-		))
+	local inheritedEnd = delta1 * (restEnd - restMid)
+	local delta2 = swing(inheritedEnd, solvedEnd - solvedMid)
 
-	side.LastDistance = distance
-	side.LastStretch = rawDistance / (l1 + l2)
-	side.LastKneeBend = math.deg(math.pi - interior)
-
-	return side.LastKneeBend, distance
+	chain.Mid.Transform =
+		midRestRotation:Inverse()
+		* (delta1:Inverse() * delta2 * delta1)
+		* midRestRotation
 end
 
-function module.SolveRig(rig, planeNormal)
-	local meta = getMeta(rig)
-	if not meta.Enabled then
-		return 0
+function module.SolveRig(rig)
+	local meta = module.Bind(rig)
+	if not meta or not meta.Enabled then
+		return false
 	end
 
-	local rigNormal = planeNormal or rig:GetPivot().RightVector
-	local solved = 0
-
-	for _, side in meta.Sides do
-		local target = rig:FindFirstChild(side.Config.Target)
-			or findNamed(rig, side.Config.Target, "BasePart")
-		if target ~= nil and target:IsA("BasePart") then
-			local targetWorld = (target.CFrame * CFrame.new(0, -target.Size.Y / 2, 0)).Position
-			if module.SolveSide(side, targetWorld, rigNormal) ~= nil then
-				solved += 1
-			end
+	for _, chain in meta.Chains do
+		local ok, err = pcall(solveChain, rig, chain)
+		if not ok then
+			safeWarn("solver " .. chain.Name .. ": " .. tostring(err))
 		end
 	end
 
-	return solved
+	return true
 end
 
-function module.GetState(rig)
-	local meta = getMeta(rig)
-	local state = {}
-	for sideName, side in meta.Sides do
-		state[sideName] = {
-			L1 = side.L1,
-			L2 = side.L2,
-			Distance = side.LastDistance,
-			Stretch = side.LastStretch,
-			KneeBend = side.LastKneeBend,
-			MeshPart = side.Mesh.Name,
-			ThighBone = side.Thigh.Name,
-			KneeBone = side.Knee.Name,
-		}
+function module.GetSample(rig)
+	local meta = module.Bind(rig)
+	local sample = {}
+
+	if not meta then
+		return sample
 	end
-	return state
+
+	for _, chain in meta.Chains do
+		if chain.Root.Parent then
+			sample[chain.Root.Name] = chain.Root.Transform
+		end
+		if chain.Mid.Parent then
+			sample[chain.Mid.Name] = chain.Mid.Transform
+		end
+	end
+
+	return sample
 end
 
-function module.GetReport(rig)
-	local meta = getMeta(rig)
-	local root, torso = module.GetRootPart(rig), module.GetTorso(rig)
-	local lines = {
-		"[BoneLegAdapter " .. module.Version .. "] " .. rig.Name
-			.. " | boneMode=" .. tostring(meta.Enabled),
-		string.format(
-			"  root=%s torso=%s",
-			root and root:GetFullName() or "nil",
-			torso and torso:GetFullName() or "nil"
-		),
-	}
-	for sideName, side in meta.Sides do
-		table.insert(lines, string.format(
-			"  %s: thigh=%s knee=%s mesh=%s L1=%.3f L2=%.3f bendSign=%d%s",
-			sideName,
-			side.Thigh.Name,
-			side.Knee.Name,
-			side.Mesh.Name,
-			side.L1,
-			side.L2,
-			side.BendSign,
-			side.Guessed and " (auto-detected)" or ""
+function module.DumpBones(rig)
+	print("[Bone IK] кости рига " .. rig:GetFullName())
+	for _, bone in allBones(rig) do
+		print(string.format(
+			"  %-42s parent=%-20s region=%s side=%s",
+			bone:GetFullName(),
+			bone.Parent and bone.Parent.Name or "nil",
+			tostring(regionOf(bone)),
+			tostring(sideOf(bone))
 			))
 	end
-	if not meta.Enabled then
-		table.insert(lines, "  No thigh/knee pair found. Check CONFIG names.")
-	end
-	return table.concat(lines, "\n")
-end
-
-function module.PrintReport(rig)
-	print(module.GetReport(rig))
 end
 
 return module

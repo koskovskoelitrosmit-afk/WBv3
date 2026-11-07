@@ -1,0 +1,1019 @@
+--!nonstrict
+--[[
+    Utils / BoneSpineAdapter  1.0.0-spine
+
+    Спина (Torso_NewMesh):
+        TorsoBoneRoot -> TorsoBone -> TorsoBone.001 -> TorsoBone.002 -> TorsoBone.003 -> TorsoBoneNeck
+
+    Контролы (обычные BasePart внутри рига, их ключует MoonAnimator):
+        SpineBaseControl    — основа спины у бёдер (TorsoBoneRoot). Двигаешь/крутишь = двигается/наклоняется таз.
+        SpineTarget         — таргет у шеи (TorsoBoneNeck). Позиция = куда тянется шея,
+                              поворот = скрут/наклон верха груди.
+        SpineLumbarControl  — поясница (TorsoBone.001). Смещение от родного места = изгиб спины
+                              (прогиб вперёд/назад/вбок), цепочка проходит через эту точку.
+        HeadControl         — OffsetPart головы (НЕ сама голова). Двигается Motor6D.Transform
+                              (Motor6D_OffsetPart), следует за шеей + собственное смещение хэндла.
+
+    Зависимости других цепочек от спины:
+        ноги  -> считаются относительно TorsoBoneRoot
+        руки  -> считаются относительно TorsoBone.003
+    BoneLegAdapter берёт дельту через module.GetDelta(rig, имяКости).
+
+    Принцип: хэндлы показывают позицию "в нулевой позе спины". Все смещения
+    считаются как (позиция хэндла - родное место). Если хэндл стоит на родном месте,
+    часть тела просто следует за своей костью спины.
+
+    Двигаются только Bone.Transform (кости спины) и Motor6D.Transform (OffsetPart).
+    MeshPart, WeldConstraint и сами Motor6D C0/C1 не изменяются.
+]]
+
+local module = {}
+module.Version = "1.0.0-spine"
+
+module.Config = {
+	Enabled = true,
+
+	-- итераций FABRIK при решении цепочки
+	Iterations = 14,
+	-- смещения меньше этого значения (в studs) считаются нулевыми
+	Epsilon = 0.0005,
+
+	Spine = {
+		Chain = {
+			"TorsoBoneRoot",
+			"TorsoBone",
+			"TorsoBone.001",
+			"TorsoBone.002",
+			"TorsoBone.003",
+			"TorsoBoneNeck",
+		},
+		-- кость поясницы, через которую проходит изгиб
+		Lumbar = "TorsoBone.001",
+
+		Base = "SpineBaseControl",
+		Target = "SpineTarget",
+		LumbarControl = "SpineLumbarControl",
+
+		-- true  = поворот таргета/основы скручивает позвоночник по длине
+		Twist = true,
+
+		-- true  = поясница в приоритете: если цепочка натянута, шея недотягивается до таргета,
+		--         но поясница встаёт ровно туда, куда её увели.
+		-- false = таргет шеи в приоритете: изгиб ограничен запасом длины цепочки.
+		LumbarPriority = true,
+	},
+
+	Head = {
+		Enabled = true,
+		Control = "HeadControl",
+		-- имя двигаемой детали (она лежит в модели Head)
+		Part = "OffsetPart",  ---OffsetPart
+		
+		-- имя Motor6D, который держит OffsetPart (если не найден по имени, ищется по Part0/Part1)
+		Motor = "Motor6D_OffsetPart", -----Motor6D_OffsetPart
+		-- кость, за которой следует голова
+		FollowBone = "TorsoBoneNeck",
+		-- true = дополнительно ставить OffsetPart.CFrame напрямую (если Motor6D не двигает деталь в edit-режиме).
+		-- ОСТОРОЖНО: может утащить всю сборку. По умолчанию выключено.
+		ForceCFrame = false,
+	},
+
+	-- от каких костей спины зависят основы ног и рук (читает BoneLegAdapter)
+	Anchors = {
+		Leg = "TorsoBoneRoot",
+		Arm = "TorsoBone.003",
+	},
+
+	Sizes = {
+		Base = 0.7,
+		Target = 0.6,
+		Lumbar = 0.55,
+		Head = 0.6,
+	},
+
+	Colors = {
+		Base = Color3.fromRGB(255, 94, 94),
+		Target = Color3.fromRGB(255, 214, 79),
+		Lumbar = Color3.fromRGB(79, 255, 190),
+		Head = Color3.fromRGB(110, 170, 255),
+	},
+
+	Tag = "R6IKRig_TAG",
+}
+
+local CFG = module.Config
+local cache = setmetatable({}, { __mode = "k" })
+local warned = {}
+
+-- ============================================================
+-- Утилиты
+-- ============================================================
+local function warnOnce(message)
+	if warned[message] then
+		return
+	end
+	warned[message] = true
+	warn("[BoneSpineAdapter] " .. tostring(message))
+end
+
+local function unit(vector)
+	if not vector or vector.Magnitude < 0.0001 then
+		return nil
+	end
+	return vector.Unit
+end
+
+-- минимальный поворот from -> to
+local function swing(fromDirection, toDirection)
+	local from = unit(fromDirection)
+	local to = unit(toDirection)
+
+	if not from or not to then
+		return CFrame.new()
+	end
+
+	local dot = math.clamp(from:Dot(to), -1, 1)
+
+	if dot > 0.99999 then
+		return CFrame.new()
+	end
+
+	if dot < -0.99999 then
+		local axis = from:Cross(Vector3.xAxis)
+		if axis.Magnitude < 0.0001 then
+			axis = from:Cross(Vector3.zAxis)
+		end
+		return CFrame.fromAxisAngle(axis.Unit, math.pi)
+	end
+
+	return CFrame.fromAxisAngle(from:Cross(to).Unit, math.acos(dot))
+end
+
+-- угол скрута поворота rot вокруг оси axis (swing-twist разложение)
+local function twistAngle(rot, axis)
+	local ok, rotAxis, angle = pcall(function()
+		return rot:ToAxisAngle()
+	end)
+	if not ok then
+		return 0
+	end
+	if angle ~= angle or math.abs(angle) < 1e-5 then
+		return 0
+	end
+
+	local s = math.sin(angle / 2)
+	local qv = rotAxis * s
+	local qw = math.cos(angle / 2)
+	local a = 2 * math.atan2(qv:Dot(axis), qw)
+
+	if a > math.pi then
+		a -= 2 * math.pi
+	elseif a < -math.pi then
+		a += 2 * math.pi
+	end
+
+	return a
+end
+
+local function getRoot(rig)
+	local humanoid = rig:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.RootPart then
+		return humanoid.RootPart
+	end
+	if rig.PrimaryPart then
+		return rig.PrimaryPart
+	end
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant.Name == "HumanoidRootPart" then
+			return descendant
+		end
+	end
+	return rig:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function findBone(rig, name)
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("Bone") and descendant.Name == name then
+			return descendant
+		end
+	end
+	return nil
+end
+
+local function meshOf(bone)
+	local current = bone.Parent
+	while current do
+		if current:IsA("MeshPart") then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+-- Rest-поза кости в локальном пространстве меша (только по Bone.CFrame, без Transform)
+local function localRest(bone, mesh)
+	local cf = bone.CFrame
+	local parent = bone.Parent
+
+	while parent and parent ~= mesh do
+		if parent:IsA("Bone") then
+			cf = parent.CFrame * cf
+		else
+			return mesh.CFrame:ToObjectSpace(bone.WorldCFrame)
+		end
+		parent = parent.Parent
+	end
+
+	if not parent then
+		return mesh.CFrame:ToObjectSpace(bone.WorldCFrame)
+	end
+
+	return cf
+end
+
+local function getControl(rig, name)
+	if not name then
+		return nil
+	end
+	local part = rig:FindFirstChild(name)
+	if part and part:IsA("BasePart") then
+		return part
+	end
+	return nil
+end
+
+-- ============================================================
+-- Bind: спина
+-- ============================================================
+local function bindSpine(rig, meta)
+	local cfg = CFG.Spine
+	local bones = {}
+	local previous = nil
+
+	for index, name in cfg.Chain do
+		local bone = previous and previous:FindFirstChild(name, true) or findBone(rig, name)
+
+		if not bone or not bone:IsA("Bone") then
+			table.insert(meta.Warnings, "Spine: не найдена кость " .. name)
+			return nil
+		end
+
+		bones[index] = bone
+		previous = bone
+	end
+
+	if #bones < 4 then
+		table.insert(meta.Warnings, "Spine: в цепочке должно быть минимум 4 кости")
+		return nil
+	end
+
+	local mesh = meshOf(bones[1])
+	if not mesh then
+		table.insert(meta.Warnings, "Spine: не найден MeshPart для " .. bones[1].Name)
+		return nil
+	end
+
+	for _, bone in bones do
+		bone.Transform = CFrame.new()
+	end
+
+	local n = #bones
+	local localCF = {}
+	local lengths = {}
+
+	for index, bone in bones do
+		localCF[index] = localRest(bone, mesh)
+
+		if index > 1 and bone.Parent ~= bones[index - 1] then
+			table.insert(
+				meta.Warnings,
+				"Spine: " .. bone.Name .. " не прямой ребёнок " .. bones[index - 1].Name
+					.. " (позы могут чуть расходиться)"
+			)
+		end
+	end
+
+	for index = 1, n - 1 do
+		lengths[index] = math.max((localCF[index + 1].Position - localCF[index].Position).Magnitude, 0.001)
+	end
+
+	-- доли длины вдоль цепочки 2..n (кость 1 — жёсткий таз)
+	local chainLength = 0
+	for index = 2, n - 1 do
+		chainLength += lengths[index]
+	end
+
+	local fractions = {}
+	local run = 0
+	fractions[2] = 0
+	for index = 3, n do
+		run += lengths[index - 1]
+		fractions[index] = run / chainLength
+	end
+
+	local lumbarIndex = table.find(cfg.Chain, cfg.Lumbar) or math.floor((n + 1) / 2)
+	local lumbarFraction = math.clamp(fractions[lumbarIndex] or 0.5, 0.15, 0.85)
+	local bumpNorm = math.max(math.sin(math.pi * lumbarFraction), 0.2)
+
+	local indexByName = {}
+	for index, bone in bones do
+		indexByName[bone.Name] = index
+	end
+
+	return {
+		Bones = bones,
+		Mesh = mesh,
+		LocalCF = localCF,
+		Lengths = lengths,
+		ChainLength = chainLength,
+		Fractions = fractions,
+		LumbarIndex = lumbarIndex,
+		BumpNorm = bumpNorm,
+		Index = indexByName,
+	}
+end
+
+-- ============================================================
+-- Bind: голова (OffsetPart)
+-- ============================================================
+local function bindHead(rig, meta)
+	local cfg = CFG.Head
+	if not cfg.Enabled then
+		return nil
+	end
+
+	local part = nil
+	for _, descendant in rig:GetDescendants() do
+		if descendant.Name == cfg.Part and descendant:IsA("BasePart") then
+			part = descendant
+			break
+		end
+	end
+
+	if not part then
+		table.insert(meta.Warnings, "Head: не найден " .. cfg.Part)
+		return nil
+	end
+
+	local motor = nil
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("Motor6D") and (descendant.Part1 == part or descendant.Part0 == part) then
+			if not motor or descendant.Name == cfg.Motor then
+				motor = descendant
+			end
+		end
+	end
+
+	local restWorld
+	local motorIsPart1 = true
+
+	if motor then
+		--print(motor)
+		--print(part)
+		motor.Transform = CFrame.new()
+		motorIsPart1 = motor.Part1 == part
+
+		if motorIsPart1 then
+			restWorld = motor.Part0.CFrame * motor.C0 * motor.C1:Inverse()
+		else
+			restWorld = motor.Part1.CFrame * motor.C1 * motor.C0:Inverse()
+		end
+	else
+		restWorld = part.CFrame
+		table.insert(meta.Warnings, "Head: Motor6D для " .. cfg.Part .. " не найден, голова будет ставиться через CFrame")
+	end
+
+	local reference = meta.Spine and meta.Spine.Mesh or getRoot(rig)
+	if not reference then
+		return nil
+	end
+
+	return {
+		Part = part,
+		Motor = motor,
+		MotorIsPart1 = motorIsPart1,
+		Reference = reference,
+		LocalRest = reference.CFrame:ToObjectSpace(restWorld),
+	}
+end
+
+local function bind(rig)
+	local meta = {
+		Rig = rig,
+		Warnings = {},
+		Deltas = {},
+		Spine = nil,
+		Head = nil,
+		Enabled = false,
+	}
+
+	if CFG.Enabled then
+		meta.Spine = bindSpine(rig, meta)
+		meta.Head = bindHead(rig, meta)
+	end
+
+	meta.Enabled = meta.Spine ~= nil or meta.Head ~= nil
+	cache[rig] = meta
+	return meta
+end
+
+function module.Bind(rig)
+	if not rig or not rig:IsA("Model") then
+		return nil
+	end
+	return cache[rig] or bind(rig)
+end
+
+function module.Rebind(rig)
+	cache[rig] = nil
+	return bind(rig)
+end
+
+function module.IsSpineRig(rig)
+	local meta = module.Bind(rig)
+	return meta ~= nil and meta.Spine ~= nil
+end
+
+-- ============================================================
+-- Restore / Reset
+-- ============================================================
+function module.Restore(rig)
+	local meta = module.Bind(rig)
+	if not meta then
+		return
+	end
+
+	if meta.Spine then
+		for _, bone in meta.Spine.Bones do
+			if bone.Parent then
+				bone.Transform = CFrame.new()
+			end
+		end
+	end
+
+	if meta.Head and meta.Head.Motor and meta.Head.Motor.Parent then
+		meta.Head.Motor.Transform = CFrame.new()
+	end
+
+	meta.Deltas = {}
+end
+
+-- Родные позиции хэндлов (в мировых координатах, следуют за мешем)
+local function restPositions(meta)
+	local result = {}
+
+	if meta.Spine then
+		local sp = meta.Spine
+		local mc = sp.Mesh.CFrame
+		local n = #sp.Bones
+		local rotation = mc.Rotation
+
+		result.Base = CFrame.new((mc * sp.LocalCF[1]).Position) * rotation
+		result.Target = CFrame.new((mc * sp.LocalCF[n]).Position) * rotation
+		result.Lumbar = CFrame.new((mc * sp.LocalCF[sp.LumbarIndex]).Position) * rotation
+	end
+
+	if meta.Head then
+		result.Head = meta.Head.Reference.CFrame * meta.Head.LocalRest
+	end
+
+	return result
+end
+
+function module.ResetControls(rig)
+	local meta = module.Bind(rig)
+	if not meta then
+		return 0
+	end
+
+	local rest = restPositions(meta)
+	local count = 0
+
+	local function reset(name, cf)
+		local part = getControl(rig, name)
+		if part and cf then
+			part.CFrame = cf
+			count += 1
+		end
+	end
+
+	reset(CFG.Spine.Base, rest.Base)
+	reset(CFG.Spine.Target, rest.Target)
+	reset(CFG.Spine.LumbarControl, rest.Lumbar)
+	reset(CFG.Head.Control, rest.Head)
+
+	return count
+end
+
+-- ============================================================
+-- Контролы
+-- ============================================================
+local function addLabel(part)
+	if part:FindFirstChild("BoneIKLabel") then
+		return
+	end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "BoneIKLabel"
+	billboard.AlwaysOnTop = true
+	billboard.Size = UDim2.fromOffset(190, 26)
+	billboard.StudsOffset = Vector3.new(0, 0.75, 0)
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.Code
+	label.TextScaled = true
+	label.TextColor3 = part.Color
+	label.TextStrokeColor3 = Color3.new()
+	label.TextStrokeTransparency = 0.4
+	label.Text = part.Name
+	label.Parent = billboard
+
+	billboard.Parent = part
+end
+
+local function ensureControl(rig, name, cframe, color, size, shape)
+	local existing = rig:FindFirstChild(name)
+
+	if existing then
+		if not existing:IsA("BasePart") then
+			return nil, name .. " занято объектом " .. existing.ClassName
+		end
+		existing.Anchored = true
+		existing.CanCollide = false
+		existing.CanTouch = false
+		existing.CanQuery = false
+		existing.CastShadow = false
+		existing.Massless = true
+		return existing, false
+	end
+
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Shape = shape or Enum.PartType.Ball
+	part.Size = Vector3.new(size, size, size)
+	part.Material = Enum.Material.Neon
+	part.Color = color
+	part.Transparency = 0.15
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Massless = true
+	part.Locked = false
+	part.CFrame = cframe
+	part.Parent = rig
+	addLabel(part)
+
+	return part, true
+end
+
+function module.EnsureControls(rig)
+	if not rig or not rig:IsA("Model") then
+		return false, "выделен не Model"
+	end
+
+	local meta = module.Rebind(rig)
+	if not meta.Enabled then
+		return false, "кости спины / OffsetPart не найдены. " .. table.concat(meta.Warnings, " | ")
+	end
+
+	local rest = restPositions(meta)
+	local created = 0
+
+	local function make(name, cf, color, size, shape)
+		local part, isNew = ensureControl(rig, name, cf, color, size, shape)
+		if not part then
+			return false, isNew
+		end
+		if isNew then
+			created += 1
+		end
+		return true
+	end
+
+	if meta.Spine then
+		local ok, err = make(CFG.Spine.Base, rest.Base, CFG.Colors.Base, CFG.Sizes.Base, Enum.PartType.Block)
+		if not ok then return false, err end
+
+		ok, err = make(CFG.Spine.Target, rest.Target, CFG.Colors.Target, CFG.Sizes.Target, Enum.PartType.Ball)
+		if not ok then return false, err end
+
+		ok, err = make(CFG.Spine.LumbarControl, rest.Lumbar, CFG.Colors.Lumbar, CFG.Sizes.Lumbar, Enum.PartType.Cylinder)
+		if not ok then return false, err end
+	end
+
+	if meta.Head then
+		local ok, err = make(CFG.Head.Control, rest.Head, CFG.Colors.Head, CFG.Sizes.Head, Enum.PartType.Block)
+		if not ok then return false, err end
+	end
+
+	local tag = CFG.Tag
+	if shared._IKRigGlobal and shared._IKRigGlobal.IKRig_Tag then
+		tag = shared._IKRigGlobal.IKRig_Tag
+	end
+	if not rig:HasTag(tag) then
+		rig:AddTag(tag)
+	end
+
+	rig:SetAttribute("BoneSpineReady", true)
+
+	print("[Bone Spine] контролы готовы, новых объектов: " .. created)
+	if meta.Spine then
+		print(string.format(
+			"  Spine: %s -> %s | base=%s | target=%s | lumbar=%s",
+			meta.Spine.Bones[1].Name,
+			meta.Spine.Bones[#meta.Spine.Bones].Name,
+			CFG.Spine.Base,
+			CFG.Spine.Target,
+			CFG.Spine.LumbarControl
+			))
+	end
+	if meta.Head then
+		print(string.format(
+			"  Head: %s | motor=%s | control=%s",
+			meta.Head.Part.Name,
+			meta.Head.Motor and meta.Head.Motor.Name or "НЕТ (через CFrame)",
+			CFG.Head.Control
+			))
+	end
+	for _, warning in meta.Warnings do
+		warn("[Bone Spine] " .. warning)
+	end
+
+	return true, "спина готова"
+end
+
+function module.GetTargets(rig)
+	local list = {}
+	local meta = module.Bind(rig)
+	if not meta then
+		return list
+	end
+
+	local function add(name)
+		local part = getControl(rig, name)
+		if part then
+			table.insert(list, part)
+		end
+	end
+
+	if meta.Spine then
+		add(CFG.Spine.Base)
+		add(CFG.Spine.LumbarControl)
+		add(CFG.Spine.Target)
+	end
+	if meta.Head then
+		add(CFG.Head.Control)
+	end
+
+	return list
+end
+
+function module.GetBones(rig)
+	local meta = module.Bind(rig)
+	if meta and meta.Spine then
+		return meta.Spine.Bones
+	end
+	return {}
+end
+
+-- Дельта (мировая) "родная поза кости -> текущая поза кости".
+-- nil, если спина не решена (тогда всё как раньше).
+function module.GetDelta(rig, boneName)
+	local meta = cache[rig]
+	if not meta or not boneName then
+		return nil
+	end
+	return meta.Deltas[boneName]
+end
+
+function module.GetAnchorName(kind)
+	return kind == "Arm" and CFG.Anchors.Arm or CFG.Anchors.Leg
+end
+
+-- ============================================================
+-- Решатель спины
+-- ============================================================
+local function solveSpine(rig, meta)
+	local sp = meta.Spine
+	local cfg = CFG.Spine
+	local mesh = sp.Mesh
+
+	if not mesh.Parent then
+		return
+	end
+
+	local mc = mesh.CFrame
+	local mcRotation = mc.Rotation
+	local n = #sp.Bones
+	local eps = CFG.Epsilon
+
+	-- rest-поза в мире
+	local R, RR = {}, {}
+	for index = 1, n do
+		local cf = mc * sp.LocalCF[index]
+		R[index] = cf.Position
+		RR[index] = cf.Rotation
+	end
+
+	local baseControl = getControl(rig, cfg.Base)
+	local targetControl = getControl(rig, cfg.Target)
+	local lumbarControl = getControl(rig, cfg.LumbarControl)
+
+	-- основа (бёдра)
+	local basePosition = R[1]
+	local baseRotation = CFrame.new()
+
+	if baseControl then
+		local offset = baseControl.Position - R[1]
+		if offset.Magnitude >= eps then
+			basePosition = R[1] + offset
+		end
+		baseRotation = baseControl.CFrame.Rotation * mcRotation:Inverse()
+	end
+
+	-- таргет (шея)
+	local targetPosition = R[n]
+	local targetRotation = CFrame.new()
+
+	if targetControl then
+		targetPosition = targetControl.Position
+		targetRotation = targetControl.CFrame.Rotation * mcRotation:Inverse()
+	end
+
+	-- поясница: смещение от родного места
+	local bulge = Vector3.zero
+
+	if lumbarControl then
+		local offset = lumbarControl.Position - R[sp.LumbarIndex]
+		if offset.Magnitude >= eps then
+			bulge = offset
+		end
+	end
+
+	-- Кость 1 (таз) жёсткая: двигается и вращается с SpineBaseControl.
+	-- Остальная цепочка 2..n решается FABRIK от конца таза до таргета.
+	local p = {}
+	p[1] = basePosition
+	p[2] = basePosition + baseRotation:VectorToWorldSpace(R[2] - R[1])
+
+	local base = p[2]
+	local toTarget = targetPosition - base
+	local distance = toTarget.Magnitude
+	local maxReach = sp.ChainLength * 0.9995
+	local reachedTarget = targetPosition
+
+	if distance > maxReach and distance > 0.0001 then
+		reachedTarget = base + toTarget.Unit * maxReach
+	end
+
+	-- начальное приближение: родная кривизна + изгиб от поясницы
+	local chordRest = R[n] - R[2]
+	local chordNew = reachedTarget - base
+	local chordSwing = swing(chordRest, chordNew)
+
+	for index = 2, n do
+		local f = sp.Fractions[index]
+		local restPoint = R[2] + chordRest * f
+		local deviation = R[index] - restPoint
+		local bump = math.sin(math.pi * f) / sp.BumpNorm
+
+		p[index] = base + chordNew * f + chordSwing:VectorToWorldSpace(deviation) + bulge * bump
+	end
+
+	-- FABRIK: длины костей сохраняются. Участок [a..b]: p[a] фиксирован, p[b] тянется к goal.
+	local lengths = sp.Lengths
+
+	local function fabrik(a, b, goal)
+		local anchor = p[a]
+
+		for _ = 1, CFG.Iterations do
+			p[b] = goal
+
+			for index = b - 1, a, -1 do
+				local d = p[index] - p[index + 1]
+				local dir = unit(d) or unit(R[index] - R[index + 1]) or Vector3.yAxis
+				p[index] = p[index + 1] + dir * lengths[index]
+			end
+
+			p[a] = anchor
+
+			for index = a + 1, b do
+				local d = p[index] - p[index - 1]
+				local dir = unit(d) or unit(R[index] - R[index - 1]) or Vector3.yAxis
+				p[index] = p[index - 1] + dir * lengths[index - 1]
+			end
+		end
+	end
+
+	local lumbarIndex = sp.LumbarIndex
+
+	if cfg.LumbarPriority and lumbarIndex > 2 and lumbarIndex < n then
+		-- Поясница имеет приоритет: сначала таз -> поясница, потом поясница -> шея.
+		-- Если цепочка натянута, шея недотянется до таргета, а поясница окажется там, куда её увели.
+		local lumbarGoal = p[lumbarIndex]
+
+		local lowerLength = 0
+		for index = 2, lumbarIndex - 1 do
+			lowerLength += lengths[index]
+		end
+
+		local toLumbar = lumbarGoal - base
+		local lumbarDistance = toLumbar.Magnitude
+		if lumbarDistance > lowerLength * 0.9995 and lumbarDistance > 0.0001 then
+			lumbarGoal = base + toLumbar.Unit * lowerLength * 0.9995
+		end
+
+		fabrik(2, lumbarIndex, lumbarGoal)
+
+		local upperLength = 0
+		for index = lumbarIndex, n - 1 do
+			upperLength += lengths[index]
+		end
+
+		local upperBase = p[lumbarIndex]
+		local toNeck = reachedTarget - upperBase
+		local neckDistance = toNeck.Magnitude
+		local neckGoal = reachedTarget
+		if neckDistance > upperLength * 0.9995 and neckDistance > 0.0001 then
+			neckGoal = upperBase + toNeck.Unit * upperLength * 0.9995
+		end
+
+		fabrik(lumbarIndex, n, neckGoal)
+	else
+		fabrik(2, n, reachedTarget)
+	end
+
+	-- мировые повороты костей
+	local Q = {}
+	Q[1] = baseRotation * RR[1]
+
+	for index = 2, n - 1 do
+		local restDirection = R[index + 1] - R[index]
+		local direction = p[index + 1] - p[index]
+		local q = swing(restDirection, direction) * RR[index]
+
+		if cfg.Twist then
+			local axis = unit(direction)
+			if axis then
+				local f = sp.Fractions[index]
+				local angle = twistAngle(targetRotation, axis) * f + twistAngle(baseRotation, axis) * (1 - f)
+				if math.abs(angle) > 1e-4 then
+					q = CFrame.fromAxisAngle(axis, angle) * q
+				end
+			end
+		end
+
+		Q[index] = q
+	end
+
+	Q[n] = targetRotation * RR[n]
+
+	-- Bone.Transform и дельты
+	for index = 1, n do
+		local transform
+
+		if index == 1 then
+			local localOffset = RR[1]:VectorToObjectSpace(basePosition - R[1])
+			transform = CFrame.new(localOffset) * (RR[1]:Inverse() * Q[1])
+		else
+			-- мировая ориентация rest-системы кости после финальной позы родителя
+			local frame = Q[index - 1] * RR[index - 1]:Inverse() * RR[index]
+			transform = frame:Inverse() * Q[index]
+		end
+
+		local bone = sp.Bones[index]
+		bone.Transform = transform
+
+		local restCF = CFrame.new(R[index]) * RR[index]
+		local posedCF = CFrame.new(p[index]) * Q[index]
+		meta.Deltas[bone.Name] = posedCF * restCF:Inverse()
+	end
+end
+
+-- ============================================================
+-- Решатель головы (OffsetPart)
+-- ============================================================
+local function solveHead(rig, meta)
+	--print("HEADSTART")
+	local head = meta.Head
+	if not head.Part.Parent or not head.Reference.Parent then
+		return
+	end
+
+	local eps = CFG.Epsilon
+	local restWorld = head.Reference.CFrame * head.LocalRest
+
+	-- голова следует за шеей
+	local followed = restWorld
+	local neckDelta = meta.Deltas[CFG.Head.FollowBone]
+	if neckDelta then
+		followed = neckDelta * restWorld
+	end
+
+	local final = followed
+	local control = getControl(rig, CFG.Head.Control)
+
+	if control then
+		local offset = control.Position - restWorld.Position
+		if offset.Magnitude < eps then
+			offset = Vector3.zero
+		end
+
+		local rotationDelta = control.CFrame.Rotation * restWorld.Rotation:Inverse()
+		final = CFrame.new(followed.Position + offset) * rotationDelta * followed.Rotation
+	end
+    --print(final)
+	local motor = head.Motor
+	print(motor)
+	print(head.Part)
+	if motor and motor.Parent and motor.Part0 and motor.Part1 then
+		if head.MotorIsPart1 then
+			motor.Transform = (motor.Part0.CFrame * motor.C0):Inverse() * final * motor.C1
+			print(motor.Transform)
+		else
+			motor.Transform = motor.C0:Inverse() * final:Inverse() * motor.Part1.CFrame * motor.C1
+			print(motor.Transform)
+		end
+
+		if CFG.Head.ForceCFrame then
+			head.Part.CFrame = final
+		end
+	else
+		print("на похуй мимо касы")
+		head.Part.CFrame = final
+	end
+end
+
+function module.SolveRig(rig)
+	local meta = module.Bind(rig)
+	if not meta or not meta.Enabled then
+		return false
+	end
+
+	meta.Deltas = {}
+
+	if meta.Spine then
+		local ok, err = pcall(solveSpine, rig, meta)
+		if not ok then
+			warnOnce("spine solver: " .. tostring(err))
+		end
+	end
+
+	if meta.Head then
+		--print("Голова настроена")
+		local ok, err = pcall(solveHead, rig, meta)
+		if not ok then
+			warnOnce("head solver: " .. tostring(err))
+		end
+	end
+
+	return true
+end
+
+-- Сэмпл для Record IK: Transform костей спины + Motor6D головы
+function module.GetSample(rig)
+	local sample = {}
+	local meta = module.Bind(rig)
+	if not meta then
+		return sample
+	end
+
+	if meta.Spine then
+		for _, bone in meta.Spine.Bones do
+			if bone.Parent then
+				sample[bone.Name] = bone.Transform
+			end
+		end
+	end
+
+	if meta.Head and meta.Head.Motor and meta.Head.Motor.Parent then
+		sample["__HeadMotor"] = meta.Head.Motor.Transform
+	end
+
+	return sample
+end
+
+function module.GetHeadMotor(rig)
+	local meta = module.Bind(rig)
+	if meta and meta.Head then
+		return meta.Head.Motor, meta.Head.Part
+	end
+	return nil, nil
+end
+
+function module.DumpBones(rig)
+	print("[Bone Spine] кости рига " .. rig:GetFullName())
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("Bone") then
+			print("  " .. descendant:GetFullName())
+		end
+	end
+end
+
+return module

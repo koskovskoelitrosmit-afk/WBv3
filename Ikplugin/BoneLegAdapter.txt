@@ -13,12 +13,19 @@
     а IK-цепочка продолжает тянуться к таргету и смотреть на pole.
     Если хэндла нет, поведение такое же, как в 2.0.0.
  
+    НОВОЕ (2.2.0): зависимость от спины (Utils/BoneSpineAdapter)
+      ноги -> основа считается относительно TorsoBoneRoot
+      руки -> основа считается относительно TorsoBone.003
+    Если спина не активна, поведение как в 2.1.0.
+    RootControl-хэндл по-прежнему задаёт ДОПОЛНИТЕЛЬНОЕ смещение корня
+    от родного (непозированного) места.
+
     Двигаются только Bone.Transform (root и mid кости).
     MeshPart, Motor6D, WeldConstraint не изменяются.
 ]]
 
 local module = {}
-module.Version = "2.1.0-roots"
+module.Version = "2.2.0-roots-spine"
 
 module.Config = {
 	AutoDetect = true,
@@ -829,6 +836,18 @@ local function swing(fromDirection, toDirection)
 	return CFrame.fromAxisAngle(from:Cross(to).Unit, math.acos(dot))
 end
 
+-- Дельта якорной кости спины (BoneSpineAdapter). nil = спина не активна.
+local function getAnchorDelta(rig, chain)
+	local global = shared._IKRigGlobal
+	local spine = global and global.utils and global.utils.BoneSpineAdapter
+	if not spine then
+		return nil
+	end
+
+	local anchorName = spine.GetAnchorName(chain.Kind)
+	return spine.GetDelta(rig, anchorName)
+end
+
 local function solveChain(rig, chain)
 	local target = chain.Target
 	if not target or not target.Parent then
@@ -863,28 +882,44 @@ local function solveChain(rig, chain)
 
 	local meshCFrame = chain.Mesh.CFrame
 	local restRoot = meshCFrame:PointToWorldSpace(chain.LocalRoot)
-	local rootPosition = restRoot
 	local restMid = meshCFrame:PointToWorldSpace(chain.LocalMid)
 	local restEnd = meshCFrame:PointToWorldSpace(chain.LocalEnd)
 
+	-- Родная (непозированная) ориентация кости. Transform считается относительно неё.
+	local unposedRootPosition = restRoot
+	local unposedRootRotation = meshCFrame.Rotation * chain.RootRestRotation
+
 	-- Смещение корня: куда пользователь утащил RootControl относительно родного места.
-	-- Вся rest-цепочка переезжает на это смещение целиком (длины костей не меняются).
+	-- Считается от НЕпозированного места, поэтому хэндл на родном месте = "следуй за спиной".
 	local rootOffset = Vector3.zero
 	if rootControl and rootControl:IsA("BasePart") then
-		rootOffset = rootControl.CFrame.Position - restRoot
+		rootOffset = rootControl.CFrame.Position - unposedRootPosition
 		if rootOffset.Magnitude < CONFIG.RootEpsilon then
 			rootOffset = Vector3.zero
 		end
 	end
+
+	local rootRestRotation = unposedRootRotation
+	local midRestRotation = meshCFrame.Rotation * chain.MidRestRotation
+
+	-- Основа цепочки зависит от спины: ноги -> TorsoBoneRoot, руки -> TorsoBone.003.
+	-- Вся rest-цепочка переезжает вместе с якорной костью (длины костей не меняются).
+	local anchorDelta = getAnchorDelta(rig, chain)
+	if anchorDelta then
+		restRoot = anchorDelta:PointToWorldSpace(restRoot)
+		restMid = anchorDelta:PointToWorldSpace(restMid)
+		restEnd = anchorDelta:PointToWorldSpace(restEnd)
+		rootRestRotation = anchorDelta.Rotation * rootRestRotation
+		midRestRotation = anchorDelta.Rotation * midRestRotation
+	end
+
+	local rootPosition = restRoot
 
 	if rootOffset ~= Vector3.zero then
 		rootPosition = restRoot + rootOffset
 		restMid = restMid + rootOffset
 		restEnd = restEnd + rootOffset
 	end
-
-	local rootRestRotation = meshCFrame.Rotation * chain.RootRestRotation
-	local midRestRotation = meshCFrame.Rotation * chain.MidRestRotation
 
 	local l1 = (restMid - rootPosition).Magnitude
 	local l2 = (restEnd - restMid).Magnitude
@@ -938,8 +973,9 @@ local function solveChain(rig, chain)
 
 	-- Поворот вокруг (уже сдвинутого) корня + перенос корня в точку RootControl.
 	-- Смещение переводим в локальные оси кости: Final = Rest * Transform.
-	local rootRotation = rootRestRotation:Inverse() * delta1 * rootRestRotation
-	local localOffset = rootRestRotation:VectorToObjectSpace(rootOffset)
+	-- rootRestRotation уже включает позу спины, unposedRootRotation — родная ориентация кости.
+	local rootRotation = unposedRootRotation:Inverse() * delta1 * rootRestRotation
+	local localOffset = unposedRootRotation:VectorToObjectSpace(rootPosition - unposedRootPosition)
 
 	chain.Root.Transform = CFrame.new(localOffset) * rootRotation
 

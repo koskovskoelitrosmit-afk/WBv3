@@ -24,13 +24,15 @@ local global = shared._IKRigGlobal
 local toolbar = global.toolbar
 local guiUtil = global.utils.Gui
 local Adapter = global.utils.BoneLegAdapter
+local SpineAdapter = global.utils.BoneSpineAdapter
 
 local RunService = game:GetService("RunService")
 local SelectionService = game:GetService("Selection")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-print("[IK Toggle] 1.5.0-roots | adapter="
-	.. tostring(Adapter and Adapter.Version or "MISSING"))
+print("[IK Toggle] 1.6.0-spine | adapter="
+	.. tostring(Adapter and Adapter.Version or "MISSING")
+	.. " | spine=" .. tostring(SpineAdapter and SpineAdapter.Version or "MISSING"))
 
 local RECORD_FPS = 30
 local RECORD_LIMIT = 30
@@ -80,6 +82,18 @@ local selectRootsButton = toolbar:CreateButton(
 local resetRootsButton = toolbar:CreateButton(
 	"Reset Roots",
 	"Вернуть хэндлы корней в родное положение",
+	""
+)
+
+local selectSpineButton = toolbar:CreateButton(
+	"Select Spine Parts",
+	"Выделить контролы спины и головы (SpineBase, SpineLumbar, SpineTarget, HeadControl)",
+	""
+)
+
+local resetSpineButton = toolbar:CreateButton(
+	"Reset Spine",
+	"Вернуть контролы спины и головы в родное положение",
 	""
 )
 
@@ -212,6 +226,19 @@ local function samplesDiffer(a, b)
 	return false
 end
 
+-- Сэмпл конечностей + спины + головы
+local function getFullSample(rig)
+	local sample = Adapter.GetSample(rig)
+
+	if SpineAdapter then
+		for name, value in SpineAdapter.GetSample(rig) do
+			sample[name] = value
+		end
+	end
+
+	return sample
+end
+
 local function recordSample(rig)
 	if not recorder.active then
 		return
@@ -234,7 +261,7 @@ local function recordSample(rig)
 
 	table.insert(recorder.samples, {
 		time = elapsed,
-		bones = Adapter.GetSample(rig),
+		bones = getFullSample(rig),
 	})
 end
 
@@ -244,6 +271,9 @@ local function startRecording()
 		return
 	end
 
+	if SpineAdapter then
+		SpineAdapter.SolveRig(state.rig)
+	end
 	Adapter.SolveRig(state.rig)
 
 	recorder.active = true
@@ -252,7 +282,7 @@ local function startRecording()
 	recorder.samples = {
 		{
 			time = 0,
-			bones = Adapter.GetSample(state.rig),
+			bones = getFullSample(state.rig),
 		},
 	}
 
@@ -333,6 +363,30 @@ local function bakeRecording()
 				kneePose.Parent = thighPose
 			end
 
+			-- Спина: цепочка TorsoBoneRoot -> ... -> TorsoBoneNeck (вложенные позы)
+			if SpineAdapter then
+				local parentPose = rootPose
+
+				for _, bone in SpineAdapter.GetBones(state.rig) do
+					local bonePose = Instance.new("Pose")
+					bonePose.Name = bone.Name
+					bonePose.Weight = 1
+					bonePose.CFrame = sample.bones[bone.Name] or CFrame.new()
+					bonePose.Parent = parentPose
+					parentPose = bonePose
+				end
+
+				-- Голова: поза OffsetPart (Motor6D.Transform), если Motor6D найден
+				local headMotor, headPart = SpineAdapter.GetHeadMotor(state.rig)
+				if headMotor and headPart and sample.bones["__HeadMotor"] then
+					local headPose = Instance.new("Pose")
+					headPose.Name = headPart.Name
+					headPose.Weight = 1
+					headPose.CFrame = sample.bones["__HeadMotor"]
+					headPose.Parent = rootPose
+				end
+			end
+
 			keyframe.Parent = sequence
 			keysAdded += 1
 		end
@@ -377,6 +431,10 @@ local function tickSolve()
 		return
 	end
 
+	-- Сначала спина и голова (считают дельты), потом ноги/руки, которые от неё зависят
+	if SpineAdapter then
+		SpineAdapter.SolveRig(state.rig)
+	end
 	Adapter.SolveRig(state.rig)
 	recordSample(state.rig)
 end
@@ -420,6 +478,9 @@ local function stopIK(restore)
 
 	if restore ~= false and state.rig and state.rig.Parent then
 		pcall(Adapter.Restore, state.rig)
+		if SpineAdapter then
+			pcall(SpineAdapter.Restore, state.rig)
+		end
 	end
 
 	state.active = false
@@ -439,6 +500,14 @@ local function startIK(rig)
 
 	Adapter.Bind(rig)
 
+	-- Спина + OffsetPart головы (необязательно: если костей нет, работает как раньше)
+	if SpineAdapter then
+		local spineOk, spineMessage = SpineAdapter.EnsureControls(rig)
+		if not spineOk then
+			warn("[IK Toggle] спина отключена: " .. tostring(spineMessage))
+		end
+	end
+
 	local sides = Adapter.GetSides(rig)
 	if #sides == 0 then
 		warn("[IK Toggle] адаптер не нашёл ноги")
@@ -448,6 +517,9 @@ local function startIK(rig)
 	state.rig = rig
 	state.active = true
 
+	if SpineAdapter then
+		SpineAdapter.SolveRig(rig)
+	end
 	Adapter.SolveRig(rig)
 	connectSolvers()
 
@@ -467,6 +539,8 @@ local function startIK(rig)
 
 	print("  Управление: двигай таргеты, поулы и *RootControl в MoonAnimator.")
 	print("  Корни: RightLegRootControl / LeftLegRootControl / RightArmRootControl / LeftArmRootControl.")
+	print("  Спина: SpineBaseControl (бёдра), SpineLumbarControl (поясница), SpineTarget (шея), HeadControl (OffsetPart).")
+	print("  Ноги считаются от TorsoBoneRoot, руки — от TorsoBone.003.")
 	print("  Кости в Moon не добавляй, иначе Moon перезапишет IK.")
 
 	return true
@@ -496,6 +570,12 @@ local function selectIkParts()
 
 	-- таргеты + поулы + RootControl для всех цепочек (ноги и руки)
 	local targets = Adapter.GetTargets(rig)
+
+	if SpineAdapter then
+		for _, part in SpineAdapter.GetTargets(rig) do
+			table.insert(targets, part)
+		end
+	end
 
 	if #targets == 0 then
 		warn("[IK Toggle] таргеты не созданы")
@@ -551,6 +631,57 @@ local function selectRootControls()
 	print("  Двигай их Move-тулом или добавь в MoonAnimator и ставь ключи.")
 end
 
+-- ============================================================
+-- Спина и голова: выделить / сбросить
+-- ============================================================
+local function selectSpineControls()
+	if not SpineAdapter then
+		warn("[IK Toggle] Utils/BoneSpineAdapter не загружен")
+		return
+	end
+
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели риг")
+		return
+	end
+
+	if not state.active then
+		if not startIK(rig) then
+			return
+		end
+	end
+
+	local parts = SpineAdapter.GetTargets(rig)
+	if #parts == 0 then
+		warn("[IK Toggle] контролы спины не найдены (проверь имена костей в BoneSpineAdapter.Config)")
+		return
+	end
+
+	SelectionService:Set(parts)
+
+	print("[IK Toggle] выделены контролы спины/головы:")
+	for _, part in parts do
+		print("  " .. part:GetFullName())
+	end
+	print("  SpineBaseControl — бёдра, SpineLumbarControl — поясница, SpineTarget — шея, HeadControl — OffsetPart.")
+end
+
+local function resetSpineControls()
+	if not SpineAdapter then
+		return
+	end
+
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели риг")
+		return
+	end
+
+	local count = SpineAdapter.ResetControls(rig)
+	print("[IK Toggle] контролов спины/головы сброшено: " .. tostring(count))
+end
+
 local function resetRootControls()
 	local rig = getRig()
 	if not rig then
@@ -597,6 +728,14 @@ end)
 
 resetRootsButton.Click:Connect(function()
 	resetRootControls()
+end)
+
+selectSpineButton.Click:Connect(function()
+	selectSpineControls()
+end)
+
+resetSpineButton.Click:Connect(function()
+	resetSpineControls()
 end)
 
 recordButton.Click:Connect(function()

@@ -26,7 +26,7 @@
 
 local module = {}
 module.Version = "2.2.0-roots-spine"
-
+local autopodviazka = true
 module.Config = {
 	AutoDetect = true,
 	BendSign = 1,
@@ -110,7 +110,24 @@ local ARM_END_HINTS = { "hand", "wrist", "palm", "finger" }
 
 local LEG_WORDS = { "leg", "thigh", "knee", "shin", "foot", "ankle", "calf" }
 local ARM_WORDS = { "arm", "shoulder", "elbow", "forearm", "wrist", "hand" }
+local function attachWithMotor6D(part0, part1, motorName)
+	if not part0 or not part1 then 
+		warn("Ошибка: part0 или part1 не существуют!")
+		return nil 
+	end
+	local motor = Instance.new("Motor6D")
+	motor.Name = motorName or "Motor6D"
+	motor.Part0 = part0 -- Основная деталь (родоначальник движения)
+	motor.Part1 = part1 -- Привязываемая деталь
 
+	-- Настраиваем начальное смещение на основе текущего положения деталей в пространстве
+	motor.C0 = part0.CFrame:Inverse() * part1.CFrame
+
+	-- Помещаем Motor6D внутрь Part0 (можно заменить на part1 или модель персонажа)
+	motor.Parent = part0
+
+	return motor
+end
 local function lower(text)
 	return string.lower(text)
 end
@@ -651,7 +668,19 @@ local function addLabel(part)
 end
 
 local function ensureControl(rig, name, position, color, size, shape)
-	local existing = rig:FindFirstChild(name)
+	local IkModel 
+	if rig:FindFirstChild("IK") then
+		IkModel=rig:FindFirstChild("IK")
+	else
+		IkModel = Instance.new("Model",rig)
+		IkModel.Name = "IK"
+		local HM = Instance.new("Humanoid",IkModel)
+		HM.Name = "Humanoid"
+		local IKRoot = rig.HumanoidRootPart:Clone()
+		IKRoot.Parent = IkModel
+		IkModel.PrimaryPart =IKRoot
+	end
+	local existing = IkModel:FindFirstChild(name)
 
 	if existing then
 		if not existing:IsA("BasePart") then
@@ -681,9 +710,12 @@ local function ensureControl(rig, name, position, color, size, shape)
 	part.Massless = true
 	part.Locked = false
 	part.CFrame = CFrame.new(position)
-	part.Parent = rig
+	part.Parent = IkModel
 	addLabel(part)
+	if autopodviazka ==true then
 
+		attachWithMotor6D(IkModel.HumanoidRootPart,part,part.Name)
+	end
 	return part
 end
 

@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-    Utils / IKAttach  1.0.0-attach
+    Utils / IKAttach  1.1.0-auto
 
     УНИВЕРСАЛЬНОЕ подключение чего угодно к IK-системе плагина.
 
@@ -20,6 +20,28 @@
     РУЧНОЙ СПОСОБ (без кнопок)
         Создай любую анкерную Part внутри рига, положи в неё ObjectValue с именем "IKTarget"
         и в Value поставь цель. При следующем Toggle IK она подхватится.
+
+    АВТОПОДКЛЮЧЕНИЕ ПРИ TOGGLE IK  (новое в 1.1.0)
+        Не нужно нажимать "Add IK Handle". Заранее, ДО первого Toggle IK, выдай нужным деталям /
+        моделям / костям рига атрибуты (Properties -> Attributes) — или нажми кнопку "Tag IK Parts",
+        она проставит их выделенным объектам сама. При Toggle IK плагин найдёт все помеченные
+        объекты, сам создаст для них <Имя>_IKHandle и подключит их.
+
+        Атрибуты на ЦЕЛИ (на самой детали / модели / кости):
+          IKAttach     (bool)   — true = подключить при Toggle IK. false = никогда не подключать.
+                                  Можно вместо него повесить CollectionService-тег "IKAttach".
+          IKFollowBone (string) — за какой костью следовать (например "TorsoBoneNeck"). Копируется в
+                                  атрибут FollowBone хэндла.
+          IKMode       (string) — "Auto" | "Motor" | "Direct". Копируется в Mode хэндла.
+          IKMotor      (string) — предпочитаемое имя Motor6D (необязательно).
+          IKEnabled    (bool)   — false = хэндл создаётся выключенным (необязательно).
+        Подключится и без IKAttach, если задан непустой IKFollowBone или IKMode
+        (кроме случая IKAttach = false).
+
+        Атрибуты читаются один раз — в момент создания хэндла. Если хэндл уже есть, он не
+        трогается и не дублируется (его настройки правишь на самом хэндле).
+        "Remove IK Handle" на автоподключённой цели ставит ей IKAttach = false, чтобы
+        следующий Toggle IK не создал хэндл заново. Чтобы вернуть — поставь IKAttach = true.
 
     АТРИБУТЫ ХЭНДЛА (видны в Properties):
         FollowBone (string)  — имя кости, за которой цель следует (например "TorsoBoneNeck").
@@ -51,8 +73,8 @@
 ]]
 
 local module = {}
-module.Version = "1.0.0-attach"
-
+module.Version = "1.1.0-auto"
+local autopodviazka = true
 module.Config = {
 	Enabled = true,
 	Epsilon = 0.0005,
@@ -67,6 +89,16 @@ module.Config = {
 
 	HandleSize = 0.5,
 	HandleColor = Color3.fromRGB(255, 130, 255),
+
+	-- автоподключение при Toggle IK (атрибуты на самой цели)
+	Auto = {
+		Enabled = true,
+		Attach = "IKAttach", -- bool; то же имя используется как CollectionService-тег
+		FollowBone = "IKFollowBone",
+		Mode = "IKMode",
+		Motor = "IKMotor",
+		HandleEnabled = "IKEnabled",
+	},
 }
 
 local CFG = module.Config
@@ -79,6 +111,24 @@ local warned = {}
 -- ============================================================
 -- Утилиты
 -- ============================================================
+local function attachWithMotor6D(part0, part1, motorName)
+	if not part0 or not part1 then 
+		warn("Ошибка: part0 или part1 не существуют!")
+		return nil 
+	end
+	local motor = Instance.new("Motor6D")
+	motor.Name = motorName or "Motor6D"
+	motor.Part0 = part0 -- Основная деталь (родоначальник движения)
+	motor.Part1 = part1 -- Привязываемая деталь
+
+	-- Настраиваем начальное смещение на основе текущего положения деталей в пространстве
+	motor.C0 = part0.CFrame:Inverse() * part1.CFrame
+
+	-- Помещаем Motor6D внутрь Part0 (можно заменить на part1 или модель персонажа)
+	motor.Parent = part0
+
+	return motor
+end
 local function warnOnce(message)
 	if warned[message] then
 		return
@@ -630,7 +680,7 @@ function Driver:SwitchToDirect(reason)
 		self.Name,
 		tostring(reason),
 		#self.Group
-	))
+		))
 end
 
 function Driver:PlaceGroup(delta)
@@ -842,7 +892,7 @@ function Driver:Describe()
 		tostring(self.Mode),
 		tostring(self.RequestedMode),
 		#self.Group
-	))
+		))
 
 	if self.Motor then
 		table.insert(lines, string.format(
@@ -852,7 +902,7 @@ function Driver:Describe()
 			self.Motor.Part1 and self.Motor.Part1.Name or "nil",
 			tostring(self.Motor.Enabled),
 			tostring(self.Motor.Active)
-		))
+			))
 	elseif self.Kind ~= "Bone" then
 		table.insert(lines, "    Motor6D не используется -> Direct")
 	end
@@ -864,7 +914,7 @@ function Driver:Describe()
 			joint:GetFullName(),
 			joint.Part0 and joint.Part0.Name or "nil",
 			joint.Part1 and joint.Part1.Name or "nil"
-		))
+			))
 	end
 
 	if self.Target:IsA("BasePart") then
@@ -903,11 +953,23 @@ local function addLabel(part, text)
 	billboard.Parent = part
 end
 
-local function createHandle(rig, item)
+local function createHandle(rig, item, settings)
 	local baseName = item.Name .. CFG.HandleSuffix
 	local name = baseName
 	local counter = 1
-	while rig:FindFirstChild(name) do
+	local IkModel 
+	if rig:FindFirstChild("IK") then
+		IkModel=rig:FindFirstChild("IK")
+	else
+		IkModel = Instance.new("Model",rig)
+		IkModel.Name = "IK"
+		local HM = Instance.new("Humanoid",IkModel)
+		HM.Name = "Humanoid"
+		local IKRoot = rig.HumanoidRootPart:Clone()
+		IKRoot.Parent = IkModel
+		IkModel.PrimaryPart =IKRoot
+	end
+	while IkModel:FindFirstChild(name) do
 		counter += 1
 		name = baseName .. counter
 	end
@@ -929,9 +991,12 @@ local function createHandle(rig, item)
 	part.CFrame = pivotOf(item)
 
 	part:SetAttribute("IKControl", true)
-	part:SetAttribute("FollowBone", "")
-	part:SetAttribute("Mode", "Auto")
-	part:SetAttribute("Enabled", true)
+	part:SetAttribute("FollowBone", settings and settings.FollowBone or "")
+	part:SetAttribute("Mode", settings and settings.Mode or "Auto")
+	part:SetAttribute("Enabled", not (settings and settings.Enabled == false))
+	if settings and settings.Motor then
+		part:SetAttribute("Motor", settings.Motor)
+	end
 
 	local value = Instance.new("ObjectValue")
 	value.Name = CFG.TargetValueName
@@ -939,8 +1004,11 @@ local function createHandle(rig, item)
 	value.Parent = part
 
 	addLabel(part, name)
-	part.Parent = rig
+	part.Parent = IkModel
+	if autopodviazka ==true then
 
+		attachWithMotor6D(IkModel.HumanoidRootPart,part,part.Name)
+	end
 	return part
 end
 
@@ -1228,7 +1296,59 @@ local function validate(rig, item, existing, reserved)
 	return nil
 end
 
-function module.Add(rig, items)
+-- Читает "что и зачем должно следовать" с самой цели.
+-- Возвращает таблицу настроек или nil, если цель не помечена для автоподключения.
+local function readAuto(item)
+	local A = CFG.Auto
+
+	if not (item:IsA("BasePart") or item:IsA("Model") or item:IsA("Bone")) then
+		return nil
+	end
+	if item:IsA("BasePart") and isControl(item) then
+		return nil
+	end
+
+	local flag = item:GetAttribute(A.Attach)
+	if flag == false then
+		return nil
+	end
+
+	local follow = item:GetAttribute(A.FollowBone)
+	local mode = item:GetAttribute(A.Mode)
+	local motor = item:GetAttribute(A.Motor)
+
+	local hasFollow = type(follow) == "string" and follow ~= ""
+	local hasMode = type(mode) == "string" and mode ~= ""
+
+	local tagged = false
+	pcall(function()
+		tagged = item:HasTag(A.Attach)
+	end)
+
+	if not (flag == true or tagged or hasFollow or hasMode) then
+		return nil
+	end
+
+	local normalized = "Auto"
+	if hasMode then
+		local lower = string.lower(mode)
+		if lower == "motor" then
+			normalized = "Motor"
+		elseif lower == "direct" then
+			normalized = "Direct"
+		end
+	end
+
+	return {
+		FollowBone = hasFollow and follow or "",
+		Mode = normalized,
+		Motor = (type(motor) == "string" and motor ~= "") and motor or nil,
+		Enabled = item:GetAttribute(A.HandleEnabled) ~= false,
+	}
+end
+
+-- items: список целей; settings: необязательная таблица { [цель] = { FollowBone, Mode, Motor, Enabled } }
+function module.Add(rig, items, settings)
 	local created, messages = {}, {}
 	local existing = existingTargets(rig)
 	local reserved = reservedBones(rig)
@@ -1238,7 +1358,7 @@ function module.Add(rig, items)
 		if reason then
 			table.insert(messages, item.Name .. ": " .. reason)
 		else
-			local handle = createHandle(rig, item)
+			local handle = createHandle(rig, item, settings and settings[item])
 			existing[item] = handle
 			table.insert(created, handle)
 		end
@@ -1255,6 +1375,65 @@ function module.Add(rig, items)
 	end
 
 	return created, messages
+end
+
+-- Автоподключение: найти в риге все цели с атрибутами IK* и создать для них хэндлы.
+-- Вызывается из Toggle IK ДО Rebind. Уже подключённые цели пропускаются (дублей нет).
+function module.AutoAttach(rig)
+	local created, messages = {}, {}
+
+	if not rig or not rig:IsA("Model") or not CFG.Enabled or not CFG.Auto.Enabled then
+		return created, messages
+	end
+
+	local existing = existingTargets(rig)
+	local items, settings = {}, {}
+
+	for _, descendant in rig:GetDescendants() do
+		if not existing[descendant] then
+			local config = readAuto(descendant)
+			if config then
+				table.insert(items, descendant)
+				settings[descendant] = config
+			end
+		end
+	end
+
+	if #items == 0 then
+		return created, messages
+	end
+
+	return module.Add(rig, items, settings)
+end
+
+-- Проставить объектам атрибуты автоподключения (кнопка "Tag IK Parts").
+-- Существующие значения не затираются, кроме IKAttach = false -> true.
+function module.Tag(rig, items)
+	local A = CFG.Auto
+	local tagged, messages = {}, {}
+
+	for _, item in items do
+		if item == rig then
+			table.insert(messages, item.Name .. ": это сам риг")
+		elseif not item:IsDescendantOf(rig) then
+			table.insert(messages, item.Name .. ": объект вне рига")
+		elseif not (item:IsA("BasePart") or item:IsA("Model") or item:IsA("Bone")) then
+			table.insert(messages, item.Name .. ": поддерживаются BasePart / Model / Bone (а это " .. item.ClassName .. ")")
+		elseif item:IsA("BasePart") and isControl(item) then
+			table.insert(messages, item.Name .. ": это уже контрол/хэндл")
+		else
+			item:SetAttribute(A.Attach, true)
+			if item:GetAttribute(A.FollowBone) == nil then
+				item:SetAttribute(A.FollowBone, "")
+			end
+			if item:GetAttribute(A.Mode) == nil then
+				item:SetAttribute(A.Mode, "Auto")
+			end
+			table.insert(tagged, item)
+		end
+	end
+
+	return tagged, messages
 end
 
 function module.Remove(rig, items)
@@ -1280,6 +1459,13 @@ function module.Remove(rig, items)
 
 	local count = 0
 	for handle in toDestroy do
+		-- цель была подключена автоматически -> помечаем, чтобы Toggle IK не создал хэндл снова
+		local value = handle:FindFirstChild(CFG.TargetValueName)
+		local target = value and value:IsA("ObjectValue") and value.Value
+		if target and target.Parent and readAuto(target) then
+			target:SetAttribute(CFG.Auto.Attach, false)
+		end
+
 		handle:Destroy()
 		count += 1
 	end
@@ -1296,7 +1482,7 @@ function module.Diagnose(rig)
 
 	print("[IKAttach] диагностика: " .. rig:GetFullName())
 	if #meta.Entries == 0 then
-		print("  подключений нет (выдели объекты и нажми Add IK Handle)")
+		print("  подключений нет (выдели объекты и нажми Add IK Handle / Tag IK Parts, либо проставь атрибут IKAttach)")
 	end
 
 	for _, entry in meta.Entries do

@@ -11,7 +11,7 @@
                               поворот = скрут/наклон верха груди.
         SpineLumbarControl  — поясница (TorsoBone.001). Смещение от родного места = изгиб спины
                               (прогиб вперёд/назад/вбок), цепочка проходит через эту точку.
-        HeadControl         — OffsetPart головы (НЕ сама голова). Двигается через Utils/IKAttach (Motor6D.Transform / Direct)
+        HeadControl         — OffsetPart головы (НЕ сама голова). Двигается Motor6D.Transform
                               (Motor6D_OffsetPart), следует за шеей + собственное смещение хэндла.
 
     Зависимости других цепочек от спины:
@@ -29,7 +29,7 @@
 
 local module = {}
 module.Version = "1.0.0-spine"
-
+local autopodviazka = true
 module.Config = {
 	Enabled = true,
 
@@ -73,13 +73,8 @@ module.Config = {
 		Motor = "Motor6D_OffsetPart", -----Motor6D_OffsetPart
 		-- кость, за которой следует голова
 		FollowBone = "TorsoBoneNeck",
-		-- Режим движения головы (см. Utils/IKAttach):
-		--   "Auto"   : Motor6D.Transform; если движок его игнорирует (joint неактивен из-за цикла сварки) —
-		--              сам отключает лишние Weld/WeldConstraint, а если не помогло — двигает группу напрямую.
-		--   "Motor"  : только Motor6D.Transform
-		--   "Direct" : всегда напрямую (CFrame группы деталей, риг не трогается)
-		Mode = "Auto",
-		-- устарело: true = то же, что Mode = "Direct" (безопасно, риг больше не "улетает")
+		-- true = дополнительно ставить OffsetPart.CFrame напрямую (если Motor6D не двигает деталь в edit-режиме).
+		-- ОСТОРОЖНО: может утащить всю сборку. По умолчанию выключено.
 		ForceCFrame = false,
 	},
 
@@ -113,6 +108,26 @@ local warned = {}
 -- ============================================================
 -- Утилиты
 -- ============================================================
+-- Функция для привязки объектов через Motor6D
+local function attachWithMotor6D(part0, part1, motorName)
+	if not part0 or not part1 then 
+		warn("Ошибка: part0 или part1 не существуют!")
+		return nil 
+	end
+	local motor = Instance.new("Motor6D")
+	motor.Name = motorName or "Motor6D"
+	motor.Part0 = part0 -- Основная деталь (родоначальник движения)
+	motor.Part1 = part1 -- Привязываемая деталь
+
+	-- Настраиваем начальное смещение на основе текущего положения деталей в пространстве
+	motor.C0 = part0.CFrame:Inverse() * part1.CFrame
+
+	-- Помещаем Motor6D внутрь Part0 (можно заменить на part1 или модель персонажа)
+	motor.Parent = part0
+
+	return motor
+end
+
 local function warnOnce(message)
 	if warned[message] then
 		return
@@ -342,20 +357,9 @@ end
 -- ============================================================
 -- Bind: голова (OffsetPart)
 -- ============================================================
-local function getAttach()
-	local global = shared._IKRigGlobal
-	return global and global.utils and global.utils.IKAttach or nil
-end
-
 local function bindHead(rig, meta)
 	local cfg = CFG.Head
 	if not cfg.Enabled then
-		return nil
-	end
-
-	local Attach = getAttach()
-	if not Attach then
-		table.insert(meta.Warnings, "Head: Utils/IKAttach не загружен (добавь модуль IKAttach в Utils)")
 		return nil
 	end
 
@@ -372,43 +376,45 @@ local function bindHead(rig, meta)
 		return nil
 	end
 
+	local motor = nil
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("Motor6D") and (descendant.Part1 == part or descendant.Part0 == part) then
+			if not motor or descendant.Name == cfg.Motor then
+				motor = descendant
+			end
+		end
+	end
+
+	local restWorld
+	local motorIsPart1 = true
+
+	if motor then
+		--print(motor)
+		--print(part)
+		motor.Transform = CFrame.new()
+		motorIsPart1 = motor.Part1 == part
+
+		if motorIsPart1 then
+			restWorld = motor.Part0.CFrame * motor.C0 * motor.C1:Inverse()
+		else
+			restWorld = motor.Part1.CFrame * motor.C1 * motor.C0:Inverse()
+		end
+	else
+		restWorld = part.CFrame
+		table.insert(meta.Warnings, "Head: Motor6D для " .. cfg.Part .. " не найден, голова будет ставиться через CFrame")
+	end
+
 	local reference = meta.Spine and meta.Spine.Mesh or getRoot(rig)
 	if not reference then
 		return nil
 	end
 
-	local mode = cfg.Mode or "Auto"
-	if cfg.ForceCFrame then
-		mode = "Direct"
-	end
-
-	local driver, err = Attach.NewDriver(rig, {
-		Target = part,
-		Reference = reference,
-		Mode = mode,
-		MotorHint = cfg.Motor,
-		Name = "Head(" .. part.Name .. ")",
-		-- дельта шеи считается спиной в этом же тике
-		FollowDelta = function()
-			return meta.Deltas[cfg.FollowBone]
-		end,
-	})
-
-	if not driver then
-		table.insert(meta.Warnings, "Head: " .. tostring(err))
-		return nil
-	end
-
-	if not driver.Motor then
-		table.insert(meta.Warnings, "Head: Motor6D для " .. cfg.Part .. " не найден, голова будет двигаться напрямую (Direct)")
-	end
-
 	return {
 		Part = part,
-		Motor = driver.Motor,
-		Driver = driver,
+		Motor = motor,
+		MotorIsPart1 = motorIsPart1,
 		Reference = reference,
-		LocalRest = driver.LocalRest,
+		LocalRest = reference.CFrame:ToObjectSpace(restWorld),
 	}
 end
 
@@ -440,14 +446,6 @@ function module.Bind(rig)
 end
 
 function module.Rebind(rig)
-	-- если старый драйвер головы ещё держит joint'ы отключёнными — возвращаем всё как было
-	local old = cache[rig]
-	if old and old.Head and old.Head.Driver then
-		pcall(function()
-			old.Head.Driver:Restore()
-		end)
-	end
-
 	cache[rig] = nil
 	return bind(rig)
 end
@@ -474,10 +472,8 @@ function module.Restore(rig)
 		end
 	end
 
-	if meta.Head and meta.Head.Driver then
-		pcall(function()
-			meta.Head.Driver:Restore()
-		end)
+	if meta.Head and meta.Head.Motor and meta.Head.Motor.Parent then
+		meta.Head.Motor.Transform = CFrame.new()
 	end
 
 	meta.Deltas = {}
@@ -560,7 +556,19 @@ local function addLabel(part)
 end
 
 local function ensureControl(rig, name, cframe, color, size, shape)
-	local existing = rig:FindFirstChild(name)
+	local IkModel 
+	if rig:FindFirstChild("IK") then
+		IkModel=rig:FindFirstChild("IK")
+	else
+		IkModel = Instance.new("Model",rig)
+		IkModel.Name = "IK"
+		local HM = Instance.new("Humanoid",IkModel)
+		HM.Name = "Humanoid"
+		local IKRoot = rig.HumanoidRootPart:Clone()
+		IKRoot.Parent = IkModel
+		IkModel.PrimaryPart =IKRoot
+	end
+	local existing = IkModel:FindFirstChild(name)
 
 	if existing then
 		if not existing:IsA("BasePart") then
@@ -590,9 +598,15 @@ local function ensureControl(rig, name, cframe, color, size, shape)
 	part.Massless = true
 	part.Locked = false
 	part.CFrame = cframe
-	part.Parent = rig
+	part.Parent = IkModel
 	addLabel(part)
 
+	if autopodviazka ==true then
+		print(part.Name.."привязал")
+		attachWithMotor6D(IkModel.HumanoidRootPart,part,part.Name)
+    end
+	
+	
 	return part, true
 end
 
@@ -661,7 +675,7 @@ function module.EnsureControls(rig)
 		print(string.format(
 			"  Head: %s | motor=%s | control=%s",
 			meta.Head.Part.Name,
-			(meta.Head.Motor and meta.Head.Motor.Name or "НЕТ") .. " / mode=" .. tostring(meta.Head.Driver.Mode),
+			meta.Head.Motor and meta.Head.Motor.Name or "НЕТ (через CFrame)",
 			CFG.Head.Control
 			))
 	end
@@ -924,13 +938,54 @@ end
 -- Решатель головы (OffsetPart)
 -- ============================================================
 local function solveHead(rig, meta)
+	--print("HEADSTART")
 	local head = meta.Head
 	if not head.Part.Parent or not head.Reference.Parent then
 		return
 	end
 
-	-- следует за шеей (FollowDelta) + смещение хэндла HeadControl
-	head.Driver:Solve(getControl(rig, CFG.Head.Control))
+	local eps = CFG.Epsilon
+	local restWorld = head.Reference.CFrame * head.LocalRest
+
+	-- голова следует за шеей
+	local followed = restWorld
+	local neckDelta = meta.Deltas[CFG.Head.FollowBone]
+	if neckDelta then
+		followed = neckDelta * restWorld
+	end
+
+	local final = followed
+	local control = getControl(rig, CFG.Head.Control)
+
+	if control then
+		local offset = control.Position - restWorld.Position
+		if offset.Magnitude < eps then
+			offset = Vector3.zero
+		end
+
+		local rotationDelta = control.CFrame.Rotation * restWorld.Rotation:Inverse()
+		final = CFrame.new(followed.Position + offset) * rotationDelta * followed.Rotation
+	end
+    --print(final)
+	local motor = head.Motor
+	--print(motor)
+	--print(head.Part)
+	if motor and motor.Parent and motor.Part0 and motor.Part1 then
+		if head.MotorIsPart1 then
+			motor.Transform = (motor.Part0.CFrame * motor.C0):Inverse() * final * motor.C1
+			--print(motor.Transform)
+		else
+			motor.Transform = motor.C0:Inverse() * final:Inverse() * motor.Part1.CFrame * motor.C1
+			--print(motor.Transform)
+		end
+
+		if CFG.Head.ForceCFrame then
+			head.Part.CFrame = final
+		end
+	else
+	--	print("на похуй мимо касы")
+		head.Part.CFrame = final
+	end
 end
 
 function module.SolveRig(rig)
@@ -980,14 +1035,6 @@ function module.GetSample(rig)
 	end
 
 	return sample
-end
-
-function module.GetHeadDriver(rig)
-	local meta = module.Bind(rig)
-	if meta and meta.Head then
-		return meta.Head.Driver
-	end
-	return nil
 end
 
 function module.GetHeadMotor(rig)

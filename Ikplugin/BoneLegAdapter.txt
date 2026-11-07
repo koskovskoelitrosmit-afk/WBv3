@@ -173,6 +173,31 @@ local function getRoot(rig)
 end
 module.GetRootPart = getRoot
 
+-- Контролы лежат в rig.IK (специальная модель), а не прямо в риге.
+-- Ищем: rig.IK -> прямо в риге -> рекурсивно по всему ригу.
+local function findControl(rig, name)
+	if not name then
+		return nil
+	end
+
+	local part = nil
+	local ikModel = rig:FindFirstChild("IK")
+	if ikModel then
+		part = ikModel:FindFirstChild(name)
+	end
+	if not part then
+		part = rig:FindFirstChild(name)
+	end
+	if not part then
+		part = rig:FindFirstChild(name, true)
+	end
+
+	if part and part:IsA("BasePart") then
+		return part
+	end
+	return nil
+end
+
 local function allBones(rig)
 	local list = {}
 	for _, descendant in rig:GetDescendants() do
@@ -516,9 +541,9 @@ local function bind(rig)
 
 	for _, chain in chains do
 		local config = chain.Kind == "Arm" and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
-		chain.Target = rig:FindFirstChild(config.Target)
-		chain.Pole = rig:FindFirstChild(config.Pole)
-		chain.RootControl = config.RootControl and rig:FindFirstChild(config.RootControl) or nil
+		chain.Target = findControl(rig, config.Target)
+		chain.Pole = findControl(rig, config.Pole)
+		chain.RootControl = config.RootControl and findControl(rig, config.RootControl) or nil
 	end
 
 	cache[rig] = meta
@@ -615,7 +640,7 @@ function module.GetRootControls(rig)
 		local part = chain.RootControl
 		if not part or not part.Parent then
 			local config = configFor(chain)
-			part = config.RootControl and rig:FindFirstChild(config.RootControl) or nil
+			part = config.RootControl and findControl(rig, config.RootControl) or nil
 			chain.RootControl = part
 		end
 		if part and part:IsA("BasePart") then
@@ -884,7 +909,7 @@ local function solveChain(rig, chain)
 	local target = chain.Target
 	if not target or not target.Parent then
 		local config = chain.Kind == "Arm" and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
-		target = rig:FindFirstChild(config.Target)
+		target = findControl(rig, config.Target)
 		chain.Target = target
 	end
 	if not target then
@@ -894,7 +919,7 @@ local function solveChain(rig, chain)
 	local pole = chain.Pole
 	if not pole or not pole.Parent then
 		local config = chain.Kind == "Arm" and CONFIG.Arms[chain.Side] or CONFIG.Legs[chain.Side]
-		pole = rig:FindFirstChild(config.Pole)
+		pole = findControl(rig, config.Pole)
 		chain.Pole = pole
 	end
 
@@ -903,7 +928,7 @@ local function solveChain(rig, chain)
 		rootControl = chain.RootControl
 		if not rootControl or not rootControl.Parent then
 			local config = configFor(chain)
-			rootControl = config.RootControl and rig:FindFirstChild(config.RootControl) or nil
+			rootControl = config.RootControl and findControl(rig, config.RootControl) or nil
 			chain.RootControl = rootControl
 		end
 	end

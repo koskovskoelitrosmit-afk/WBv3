@@ -149,15 +149,21 @@ end)
 -- ============================================================
 -- Выбор рига
 -- ============================================================
+-- "IK" — служебная модель внутри рига (в ней свой Humanoid и контролы).
+-- Её нельзя считать ригом, иначе при выделенном хэндле плагин ищет кости не там.
+local function isIkModel(model)
+	return model.Name == "IK" and model.Parent ~= nil and model.Parent:IsA("Model")
+end
+
 local function getRig()
 	for _, item in SelectionService:Get() do
-		if item:IsA("Model") and item:FindFirstChildOfClass("Humanoid") then
+		if item:IsA("Model") and item:FindFirstChildOfClass("Humanoid") and not isIkModel(item) then
 			return item
 		end
 
 		local ancestor = item:FindFirstAncestorOfClass("Model")
 		while ancestor do
-			if ancestor:FindFirstChildOfClass("Humanoid") then
+			if ancestor:FindFirstChildOfClass("Humanoid") and not isIkModel(ancestor) then
 				return ancestor
 			end
 			ancestor = ancestor:FindFirstAncestorOfClass("Model")

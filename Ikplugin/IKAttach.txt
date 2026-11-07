@@ -1,0 +1,1313 @@
+--!nonstrict
+--[[
+    Utils / IKAttach  1.0.0-attach
+
+    УНИВЕРСАЛЬНОЕ подключение чего угодно к IK-системе плагина.
+
+    ЧТО УМЕЕТ
+        Цель (Target) может быть:
+          * BasePart  (хвост, оружие, шляпа, OffsetPart головы ...)
+          * Model     (любая группа деталей)
+          * Bone      (кость skinned-меша)
+        Для каждой цели создаётся хэндл (обычная Part, как остальные контролы).
+        Двигаешь/крутишь хэндл (руками, в MoonAnimator, скриптом) — цель следует за ним.
+
+    КАК ПОДКЛЮЧИТЬ (самый простой способ)
+        1. Выдели в Explorer всё, что хочешь подключить (детали / модели / кости рига).
+        2. Нажми кнопку "Add IK Handle" в тулбаре IK Tools.
+        3. Появятся Part'ы  <Имя>_IKHandle  — их и ключуй в MoonAnimator.
+
+    РУЧНОЙ СПОСОБ (без кнопок)
+        Создай любую анкерную Part внутри рига, положи в неё ObjectValue с именем "IKTarget"
+        и в Value поставь цель. При следующем Toggle IK она подхватится.
+
+    АТРИБУТЫ ХЭНДЛА (видны в Properties):
+        FollowBone (string)  — имя кости, за которой цель следует (например "TorsoBoneNeck").
+                               Пусто = цель не следует ни за какой костью.
+                               Для целей-костей не нужен: кость и так следует за родителем.
+        Mode       (string)  — "Auto" (по умолчанию) | "Motor" | "Direct"
+                               Auto   : если у цели есть Motor6D — двигаем через Motor6D.Transform,
+                                        а если движок его игнорирует — сам переключается на Direct.
+                               Motor  : только Motor6D.Transform.
+                               Direct : цель двигается напрямую (CFrame), а связи с остальным
+                                        ригом на время работы IK отключаются.
+        Enabled    (bool)    — false = хэндл временно не управляет целью.
+        (Mode читается при включении IK; FollowBone и Enabled — каждый кадр.)
+
+    ПОЧЕМУ НЕ ДВИГАЛАСЬ ГОЛОВА (главное исправление)
+        У OffsetPart кроме Motor6D есть ещё Weld / WeldConstraint, которые замыкают
+        цикл сварки (OffsetPart -> MainPart -> ... -> Head -> Motor6D -> OffsetPart).
+        Roblox в таком случае делает один из joint'ов НЕАКТИВНЫМ (JointInstance.Active = false),
+        и Motor6D.Transform меняется, но деталь не двигает. Именно это ты видел.
+        ForceCFrame тащил деталь вместе со всей сборкой, поэтому риг "улетал".
+
+        Что делает IKAttach:
+          1. Находит joint'ы, которые замыкают цикл, и на время работы IK отключает ТОЛЬКО их
+             (Enabled = false). При выключении IK всё возвращается.
+          2. Если Motor6D после этого всё равно не двигает деталь — автоматически
+             переходит в режим Direct и двигает группу деталей напрямую, не задевая риг.
+          3. Motor6D.Transform при этом всё равно считается — Record IK / Bake IK
+             продолжают получать значения.
+]]
+
+local module = {}
+module.Version = "1.0.0-attach"
+
+module.Config = {
+	Enabled = true,
+	Epsilon = 0.0005,
+
+	-- сколько тиков подряд Motor6D может "не двигать" деталь, прежде чем Auto перейдёт в Direct
+	MissTicks = 6,
+
+	TargetValueName = "IKTarget",
+	HandleSuffix = "_IKHandle",
+	-- метка на joint'ах, отключённых плагином (чтобы починить, если Studio закрыли посреди IK)
+	DisabledAttr = "IKAttach_DisabledJoint",
+
+	HandleSize = 0.5,
+	HandleColor = Color3.fromRGB(255, 130, 255),
+}
+
+local CFG = module.Config
+
+local cache = setmetatable({}, { __mode = "k" })
+local liveCuts = setmetatable({}, { __mode = "k" })
+local modeMemory = setmetatable({}, { __mode = "k" })
+local warned = {}
+
+-- ============================================================
+-- Утилиты
+-- ============================================================
+local function warnOnce(message)
+	if warned[message] then
+		return
+	end
+	warned[message] = true
+	warn("[IKAttach] " .. tostring(message))
+end
+
+local function getGlobal()
+	return shared._IKRigGlobal
+end
+
+local function getUtil(name)
+	local global = getGlobal()
+	return global and global.utils and global.utils[name] or nil
+end
+
+local function getRoot(rig)
+	local humanoid = rig:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.RootPart then
+		return humanoid.RootPart
+	end
+	if rig.PrimaryPart then
+		return rig.PrimaryPart
+	end
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant.Name == "HumanoidRootPart" then
+			return descendant
+		end
+	end
+	return rig:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function meshOf(bone)
+	local current = bone.Parent
+	while current do
+		if current:IsA("MeshPart") then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+-- rest-поза кости в пространстве меша (только Bone.CFrame, без Transform)
+local function localRest(bone, mesh)
+	local cf = bone.CFrame
+	local parent = bone.Parent
+
+	while parent and parent ~= mesh do
+		if parent:IsA("Bone") then
+			cf = parent.CFrame * cf
+		else
+			return mesh.CFrame:ToObjectSpace(bone.WorldCFrame)
+		end
+		parent = parent.Parent
+	end
+
+	if not parent then
+		return mesh.CFrame:ToObjectSpace(bone.WorldCFrame)
+	end
+
+	return cf
+end
+
+-- мировая поза кости С учётом Transform всей цепочки родителей
+local function posedWorld(bone, mesh)
+	local chain = {}
+	local current = bone
+
+	while current and current ~= mesh and current:IsA("Bone") do
+		table.insert(chain, 1, current)
+		current = current.Parent
+	end
+
+	local cf = mesh.CFrame
+	for _, b in chain do
+		cf = cf * b.CFrame * b.Transform
+	end
+	return cf
+end
+
+local function boneDepth(bone)
+	local depth = 0
+	local current = bone.Parent
+	while current do
+		depth += 1
+		current = current.Parent
+	end
+	return depth
+end
+
+local function poseDelta(a, b)
+	local distance = (a.Position - b.Position).Magnitude
+	local _, angle = (a.Rotation:Inverse() * b.Rotation):ToAxisAngle()
+	return distance, math.abs(angle)
+end
+
+local function isControl(inst)
+	if not inst:IsA("BasePart") then
+		return false
+	end
+	if inst:GetAttribute("IKControl") then
+		return true
+	end
+	if inst:FindFirstChild("BoneIKLabel") then
+		return true
+	end
+	if inst:FindFirstChild(CFG.TargetValueName) then
+		return true
+	end
+	return false
+end
+
+local function isRigid(inst)
+	return inst:IsA("JointInstance") or inst:IsA("WeldConstraint")
+end
+
+local function pivotOf(item)
+	if item:IsA("Bone") then
+		return item.WorldCFrame
+	elseif item:IsA("BasePart") then
+		return item.CFrame
+	elseif item:IsA("Model") then
+		return item:GetPivot()
+	end
+	return CFrame.new()
+end
+
+-- ============================================================
+-- Joint'ы
+-- ============================================================
+local function buildIndex(rig, groupSet)
+	local index = {}
+	local seen = {}
+
+	local function add(joint)
+		if seen[joint] then
+			return
+		end
+		seen[joint] = true
+
+		local a, b = joint.Part0, joint.Part1
+		if not a or not b or a == b then
+			return
+		end
+
+		index[a] = index[a] or {}
+		table.insert(index[a], joint)
+		index[b] = index[b] or {}
+		table.insert(index[b], joint)
+	end
+
+	for _, descendant in rig:GetDescendants() do
+		if isRigid(descendant) then
+			add(descendant)
+		end
+	end
+
+	if groupSet then
+		for part in groupSet do
+			local ok, joints = pcall(part.GetJoints, part)
+			if ok and joints then
+				for _, joint in joints do
+					if isRigid(joint) then
+						add(joint)
+					end
+				end
+			end
+		end
+	end
+
+	return index
+end
+
+local function otherEnd(joint, part)
+	if joint.Part0 == part then
+		return joint.Part1
+	end
+	return joint.Part0
+end
+
+-- поиск кратчайшего пути от группы S до любого "якоря" (части остального рига)
+local function findPath(index, S, anchors, cuts, excluded)
+	local parentEdge = {}
+	local visited = {}
+	local queue = {}
+
+	for part in S do
+		visited[part] = true
+		table.insert(queue, part)
+	end
+
+	local head = 1
+	while head <= #queue do
+		local part = queue[head]
+		head += 1
+
+		if anchors[part] and not S[part] then
+			local path = {}
+			local current = part
+			while not S[current] do
+				local edge = parentEdge[current]
+				table.insert(path, 1, { joint = edge.joint, from = edge.from, to = current })
+				current = edge.from
+			end
+			return path
+		end
+
+		local joints = index[part]
+		if joints then
+			for _, joint in joints do
+				if joint.Enabled and not cuts[joint] and not excluded[joint] then
+					local other = otherEnd(joint, part)
+					if other and not visited[other] then
+						visited[other] = true
+						parentEdge[other] = { joint = joint, from = part }
+						table.insert(queue, other)
+					end
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
+local function collectFollowers(index, S, cuts, excluded)
+	local visited = {}
+	local queue = {}
+	local list = {}
+
+	for part in S do
+		visited[part] = true
+		table.insert(queue, part)
+	end
+
+	local head = 1
+	while head <= #queue do
+		local part = queue[head]
+		head += 1
+
+		if part:IsA("BasePart") and not isControl(part) then
+			table.insert(list, part)
+		end
+
+		local joints = index[part]
+		if joints then
+			for _, joint in joints do
+				if joint.Enabled and not cuts[joint] and not excluded[joint] then
+					local other = otherEnd(joint, part)
+					if other and not visited[other] then
+						visited[other] = true
+						table.insert(queue, other)
+					end
+				end
+			end
+		end
+	end
+
+	return list
+end
+
+local function disableJoint(joint, record)
+	if not joint.Parent or not joint.Enabled then
+		return
+	end
+	joint:SetAttribute(CFG.DisabledAttr, true)
+	joint.Enabled = false
+	liveCuts[joint] = true
+	table.insert(record, joint)
+end
+
+local function reenableAll(record)
+	for _, joint in record do
+		liveCuts[joint] = nil
+		if joint.Parent then
+			joint:SetAttribute(CFG.DisabledAttr, nil)
+			joint.Enabled = true
+		end
+	end
+	table.clear(record)
+end
+
+-- Если Studio закрыли / плагин упал посреди IK — возвращаем отключённые joint'ы
+function module.CleanupLeftovers(rig)
+	local count = 0
+	for _, descendant in rig:GetDescendants() do
+		if descendant:GetAttribute(CFG.DisabledAttr) and not liveCuts[descendant] then
+			descendant:SetAttribute(CFG.DisabledAttr, nil)
+			if isRigid(descendant) then
+				descendant.Enabled = true
+				count += 1
+			end
+		end
+	end
+	if count > 0 then
+		print("[IKAttach] восстановлено joint'ов после прошлой сессии: " .. count)
+	end
+	return count
+end
+
+local function collectGroup(target)
+	local set, list = {}, {}
+
+	local function add(part)
+		if part:IsA("BasePart") and not set[part] and not isControl(part) then
+			set[part] = true
+			table.insert(list, part)
+		end
+	end
+
+	add(target)
+	for _, descendant in target:GetDescendants() do
+		add(descendant)
+	end
+
+	return set, list
+end
+
+local function findMotor(index, S, target, hint)
+	if not target:IsA("BasePart") then
+		return nil
+	end
+
+	local best, bestScore = nil, -1
+	local joints = index[target]
+	if not joints then
+		return nil
+	end
+
+	for _, joint in joints do
+		if joint:IsA("Motor6D") and joint.Enabled and joint.Part0 and joint.Part1 then
+			local other = otherEnd(joint, target)
+			if not S[other] then
+				local score = (joint.Part1 == target and 2 or 0) + (hint and joint.Name == hint and 1 or 0)
+				if score > bestScore then
+					best, bestScore = joint, score
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+-- ============================================================
+-- Driver — управляет одной целью
+-- ============================================================
+local Driver = {}
+Driver.__index = Driver
+
+local function applyControl(restWorld, followed, control, eps)
+	if not control then
+		return followed
+	end
+
+	local offset = control.Position - restWorld.Position
+	if offset.Magnitude < eps then
+		offset = Vector3.zero
+	end
+
+	local rotationDelta = control.CFrame.Rotation * restWorld.Rotation:Inverse()
+	return CFrame.new(followed.Position + offset) * rotationDelta * followed.Rotation
+end
+
+--[[
+    opts:
+        Target      Instance (BasePart | Model | Bone)  — обязательно
+        Reference   BasePart — относительно чего хранится родное положение (по умолчанию корень рига)
+        Mode        "Auto" | "Motor" | "Direct"
+        MotorHint   имя предпочитаемого Motor6D
+        FollowBone  string | function -> string  (имя кости, за которой следует цель)
+        FollowDelta function -> CFrame?  (готовая дельта "родная поза -> текущая", перекрывает FollowBone)
+        Name        строка для логов
+]]
+function module.NewDriver(rig, opts)
+	local target = opts.Target
+	if not target or not target.Parent then
+		return nil, "цель не существует"
+	end
+
+	local self = setmetatable({}, Driver)
+	self.Rig = rig
+	self.Target = target
+	self.Name = opts.Name or target.Name
+	self.FollowCache = {}
+	self.FollowBoneOpt = opts.FollowBone
+	self.FollowDeltaFn = opts.FollowDelta
+	self.RequestedMode = opts.Mode or "Auto"
+	self.Engaged = false
+	self.Applied = false
+	self.DirectApplied = false
+	self.Misses = 0
+	self.Cuts = {}
+	self.Disabled = {}
+	self.Group = {}
+	self.GroupLocal = {}
+
+	-- ---------------- Bone ----------------
+	if target:IsA("Bone") then
+		local mesh = meshOf(target)
+		if not mesh then
+			return nil, "у кости нет MeshPart"
+		end
+
+		target.Transform = CFrame.new()
+
+		self.Kind = "Bone"
+		self.Mode = "Bone"
+		self.Mesh = mesh
+		self.Reference = mesh
+		self.LocalRest = localRest(target, mesh)
+		self.Depth = boneDepth(target)
+		return self
+	end
+
+	-- ---------------- Part / Model ----------------
+	if not (target:IsA("BasePart") or target:IsA("Model")) then
+		return nil, "неподдерживаемый класс " .. target.ClassName
+	end
+
+	self.Kind = target:IsA("Model") and "Model" or "Part"
+	self.Depth = 1000
+
+	local root = getRoot(rig)
+	local reference = opts.Reference or root
+	if not reference then
+		return nil, "не найден корень рига"
+	end
+	self.Reference = reference
+
+	local S, list = collectGroup(target)
+	if #list == 0 then
+		return nil, "в цели нет ни одной BasePart"
+	end
+	if (root and S[root]) or S[reference] then
+		return nil, "цель содержит корень рига / опорную деталь"
+	end
+
+	local index = buildIndex(rig, S)
+	local motor = findMotor(index, S, target, opts.MotorHint)
+
+	local restWorld
+	if motor and motor.Part1 == target then
+		motor.Transform = CFrame.new()
+		restWorld = motor.Part0.CFrame * motor.C0 * motor.C1:Inverse()
+	else
+		motor = nil
+		restWorld = target:IsA("BasePart") and target.CFrame or target:GetPivot()
+	end
+
+	self.Motor = motor
+	self.LocalRest = reference.CFrame:ToObjectSpace(restWorld)
+
+	-- режим
+	local requested = self.RequestedMode
+	if requested == "Motor" and not motor then
+		warnOnce(self.Name .. ": Mode=Motor, но Motor6D с Part1 = цель не найден, использую Direct")
+	end
+	if motor and requested ~= "Direct" and not modeMemory[target] then
+		self.Mode = "Motor"
+	else
+		self.Mode = "Direct"
+	end
+
+	-- joint'ы, замыкающие цикл: отключаем минимум, чтобы Motor6D стал активным
+	local anchors = {}
+	if motor then
+		anchors[motor.Part0] = true
+	end
+	if root then
+		anchors[root] = true
+	end
+
+	local excluded = {}
+	if motor then
+		excluded[motor] = true
+	end
+
+	local cuts = {}
+	for _ = 1, 32 do
+		local path = findPath(index, S, anchors, cuts, excluded)
+		if not path then
+			break
+		end
+		local joint = path[1].joint
+		cuts[joint] = true
+		table.insert(self.Cuts, joint)
+	end
+
+	if findPath(index, S, anchors, cuts, excluded) then
+		warnOnce(self.Name .. ": не удалось полностью разорвать связи с ригом, возможны артефакты")
+	end
+
+	-- группа деталей, которые едут вместе с целью (для режима Direct)
+	self.Group = collectFollowers(index, S, cuts, excluded)
+	local refCF = reference.CFrame
+	for _, part in self.Group do
+		self.GroupLocal[part] = refCF:ToObjectSpace(part.CFrame)
+	end
+	if target:IsA("BasePart") then
+		self.GroupLocal[target] = self.LocalRest
+	end
+
+	return self
+end
+
+function Driver:GetRestWorld()
+	return self.Reference.CFrame * self.LocalRest
+end
+
+-- ---------- joint'ы ----------
+function Driver:Engage()
+	if self.Engaged or self.Kind == "Bone" then
+		return
+	end
+	self.Engaged = true
+
+	for _, joint in self.Cuts do
+		disableJoint(joint, self.Disabled)
+	end
+
+	if self.Mode == "Direct" and self.Motor then
+		disableJoint(self.Motor, self.Disabled)
+	end
+
+	if self.Mode == "Motor" and self.Motor and not self.Motor.Active then
+		-- заставляем движок пересчитать, какой joint в цикле активен
+		self.Motor.Enabled = false
+		self.Motor.Enabled = true
+	end
+end
+
+function Driver:SwitchToDirect(reason)
+	if self.Mode == "Direct" then
+		return
+	end
+
+	self.Mode = "Direct"
+	modeMemory[self.Target] = true
+
+	if self.Engaged and self.Motor then
+		disableJoint(self.Motor, self.Disabled)
+	end
+
+	warnOnce(string.format(
+		"%s: Motor6D не двигает деталь (%s) -> перехожу в режим Direct (CFrame группы из %d деталей)",
+		self.Name,
+		tostring(reason),
+		#self.Group
+	))
+end
+
+function Driver:PlaceGroup(delta)
+	local refCF = self.Reference.CFrame
+	local parts, cframes = {}, {}
+
+	for _, part in self.Group do
+		local localCF = self.GroupLocal[part]
+		if part.Parent and localCF then
+			table.insert(parts, part)
+			table.insert(cframes, delta * (refCF * localCF))
+		end
+	end
+
+	if #parts == 0 then
+		return
+	end
+
+	self.DirectApplied = true
+
+	if #parts == 1 then
+		parts[1].CFrame = cframes[1]
+		return
+	end
+
+	local ok = pcall(function()
+		workspace:BulkMoveTo(parts, cframes)
+	end)
+
+	if not ok then
+		for index, part in parts do
+			part.CFrame = cframes[index]
+		end
+	end
+end
+
+function Driver:GetFollowDelta()
+	if self.FollowDeltaFn then
+		local ok, delta = pcall(self.FollowDeltaFn)
+		if ok then
+			return delta
+		end
+		return nil
+	end
+
+	local name = self.FollowBoneOpt
+	if type(name) == "function" then
+		local ok, value = pcall(name)
+		name = ok and value or nil
+	end
+	if type(name) ~= "string" or name == "" then
+		return nil
+	end
+
+	local info = self.FollowCache[name]
+	if info == nil then
+		info = false
+		local bone = self.Rig:FindFirstChild(name, true)
+		if bone and bone:IsA("Bone") then
+			local mesh = meshOf(bone)
+			if mesh then
+				info = { Bone = bone, Mesh = mesh, Local = localRest(bone, mesh) }
+			end
+		end
+		if not info then
+			warnOnce(self.Name .. ": FollowBone '" .. name .. "' не найден (нужна кость skinned-меша)")
+		end
+		self.FollowCache[name] = info
+	end
+
+	if not info or not info.Bone.Parent or not info.Mesh.Parent then
+		return nil
+	end
+
+	local rest = info.Mesh.CFrame * info.Local
+	local posed = posedWorld(info.Bone, info.Mesh)
+	return posed * rest:Inverse()
+end
+
+-- проверка: двигает ли Motor6D деталь на самом деле
+function Driver:CheckMiss(restWorld)
+	local motor = self.Motor
+	if not motor or self.Mode ~= "Motor" or self.RequestedMode ~= "Auto" or not self.Applied then
+		return
+	end
+
+	local part0 = motor.Part0
+	if not part0 or not self.Target.Parent then
+		return
+	end
+
+	local expected = part0.CFrame * motor.C0 * motor.Transform * motor.C1:Inverse()
+	local actual = self.Target.CFrame
+
+	local expPos, expAng = poseDelta(expected, restWorld)
+	local actPos, actAng = poseDelta(actual, restWorld)
+
+	local wanted = expPos > 0.05 or expAng > 0.03
+	local stuck = actPos < 0.01 and actAng < 0.01
+
+	if wanted and stuck then
+		self.Misses += 1
+	else
+		self.Misses = 0
+	end
+
+	if self.Misses >= CFG.MissTicks then
+		self:SwitchToDirect("Active=" .. tostring(motor.Active))
+	end
+end
+
+function Driver:Solve(control)
+	local reference = self.Reference
+	local target = self.Target
+
+	if not reference or not reference.Parent or not target.Parent then
+		return
+	end
+
+	local eps = CFG.Epsilon
+	local restWorld = reference.CFrame * self.LocalRest
+
+	-- ---------------- Bone ----------------
+	if self.Kind == "Bone" then
+		local parent = target.Parent
+		local parentPosed
+		if parent and parent:IsA("Bone") then
+			parentPosed = posedWorld(parent, self.Mesh)
+		else
+			parentPosed = self.Mesh.CFrame
+		end
+
+		local base = parentPosed * target.CFrame
+		local final = applyControl(restWorld, base, control, eps)
+		target.Transform = base:Inverse() * final
+		self.Applied = true
+		return
+	end
+
+	-- ---------------- Part / Model ----------------
+	self:Engage()
+	self:CheckMiss(restWorld)
+
+	local followed = restWorld
+	local delta = self:GetFollowDelta()
+	if delta then
+		followed = delta * restWorld
+	end
+
+	local final = applyControl(restWorld, followed, control, eps)
+
+	-- Motor6D.Transform считаем всегда (нужен для Record/Bake)
+	local motor = self.Motor
+	if motor and motor.Parent and motor.Part0 then
+		motor.Transform = (motor.Part0.CFrame * motor.C0):Inverse() * final * motor.C1
+	end
+
+	if self.Mode == "Direct" then
+		self:PlaceGroup(final * restWorld:Inverse())
+	end
+
+	self.Applied = true
+end
+
+function Driver:Restore()
+	if self.Kind == "Bone" then
+		if self.Target.Parent then
+			self.Target.Transform = CFrame.new()
+		end
+		self.Applied = false
+		return
+	end
+
+	if self.Motor and self.Motor.Parent then
+		self.Motor.Transform = CFrame.new()
+	end
+
+	if self.Engaged then
+		if self.DirectApplied and self.Reference and self.Reference.Parent then
+			self:PlaceGroup(CFrame.new())
+		end
+		reenableAll(self.Disabled)
+		self.Engaged = false
+	end
+
+	self.DirectApplied = false
+	self.Applied = false
+	self.Misses = 0
+end
+
+-- ключ и CFrame для Record IK
+function Driver:GetSampleEntry()
+	if self.Kind == "Bone" then
+		if self.Target.Parent then
+			return self.Target.Name, self.Target.Transform
+		end
+	elseif self.Motor and self.Motor.Parent then
+		return "__M:" .. self.Motor:GetFullName(), self.Motor.Transform
+	end
+	return nil, nil
+end
+
+function Driver:Describe()
+	local lines = {}
+	table.insert(lines, string.format(
+		"%s  [%s]  mode=%s (запрошен %s)  группа=%d дет.",
+		self.Name,
+		self.Kind,
+		tostring(self.Mode),
+		tostring(self.RequestedMode),
+		#self.Group
+	))
+
+	if self.Motor then
+		table.insert(lines, string.format(
+			"    Motor6D '%s': Part0=%s Part1=%s Enabled=%s Active=%s",
+			self.Motor.Name,
+			self.Motor.Part0 and self.Motor.Part0.Name or "nil",
+			self.Motor.Part1 and self.Motor.Part1.Name or "nil",
+			tostring(self.Motor.Enabled),
+			tostring(self.Motor.Active)
+		))
+	elseif self.Kind ~= "Bone" then
+		table.insert(lines, "    Motor6D не используется -> Direct")
+	end
+
+	for _, joint in self.Cuts do
+		table.insert(lines, string.format(
+			"    разорван цикл: %s '%s' (%s <-> %s)",
+			joint.ClassName,
+			joint:GetFullName(),
+			joint.Part0 and joint.Part0.Name or "nil",
+			joint.Part1 and joint.Part1.Name or "nil"
+		))
+	end
+
+	if self.Target:IsA("BasePart") then
+		table.insert(lines, "    Anchored=" .. tostring(self.Target.Anchored))
+	end
+
+	return lines
+end
+
+-- ============================================================
+-- Хэндлы
+-- ============================================================
+local function addLabel(part, text)
+	if part:FindFirstChild("BoneIKLabel") then
+		return
+	end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "BoneIKLabel"
+	billboard.AlwaysOnTop = true
+	billboard.Size = UDim2.fromOffset(190, 26)
+	billboard.StudsOffset = Vector3.new(0, 0.75, 0)
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.Code
+	label.TextScaled = true
+	label.TextColor3 = part.Color
+	label.TextStrokeColor3 = Color3.new()
+	label.TextStrokeTransparency = 0.4
+	label.Text = text or part.Name
+	label.Parent = billboard
+
+	billboard.Parent = part
+end
+
+local function createHandle(rig, item)
+	local baseName = item.Name .. CFG.HandleSuffix
+	local name = baseName
+	local counter = 1
+	while rig:FindFirstChild(name) do
+		counter += 1
+		name = baseName .. counter
+	end
+
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Shape = item:IsA("Bone") and Enum.PartType.Ball or Enum.PartType.Block
+	part.Size = Vector3.new(CFG.HandleSize, CFG.HandleSize, CFG.HandleSize)
+	part.Material = Enum.Material.Neon
+	part.Color = CFG.HandleColor
+	part.Transparency = 0.15
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Massless = true
+	part.Locked = false
+	part.CFrame = pivotOf(item)
+
+	part:SetAttribute("IKControl", true)
+	part:SetAttribute("FollowBone", "")
+	part:SetAttribute("Mode", "Auto")
+	part:SetAttribute("Enabled", true)
+
+	local value = Instance.new("ObjectValue")
+	value.Name = CFG.TargetValueName
+	value.Value = item
+	value.Parent = part
+
+	addLabel(part, name)
+	part.Parent = rig
+
+	return part
+end
+
+-- ============================================================
+-- Bind / Restore
+-- ============================================================
+local function bind(rig)
+	module.CleanupLeftovers(rig)
+
+	local meta = {
+		Rig = rig,
+		Entries = {},
+		Failed = {},
+		Warnings = {},
+	}
+	cache[rig] = meta
+
+	if not CFG.Enabled then
+		return meta
+	end
+
+	local handles = {}
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			local value = descendant:FindFirstChild(CFG.TargetValueName)
+			if value and value:IsA("ObjectValue") then
+				table.insert(handles, { Handle = descendant, Target = value.Value })
+			end
+		end
+	end
+
+	for _, item in handles do
+		local handle, target = item.Handle, item.Target
+
+		if not target or not target.Parent then
+			table.insert(meta.Failed, handle)
+			table.insert(meta.Warnings, handle.Name .. ": IKTarget пуст")
+		elseif not target:IsDescendantOf(rig) then
+			table.insert(meta.Failed, handle)
+			table.insert(meta.Warnings, handle.Name .. ": цель вне рига")
+		else
+			local mode = handle:GetAttribute("Mode")
+			if mode ~= "Motor" and mode ~= "Direct" then
+				mode = "Auto"
+			end
+
+			local hint = handle:GetAttribute("Motor")
+			local driver, err = module.NewDriver(rig, {
+				Target = target,
+				Name = target.Name,
+				Mode = mode,
+				MotorHint = type(hint) == "string" and hint or nil,
+				FollowBone = function()
+					return handle:GetAttribute("FollowBone")
+				end,
+			})
+
+			if driver then
+				table.insert(meta.Entries, { Handle = handle, Target = target, Driver = driver })
+			else
+				table.insert(meta.Failed, handle)
+				table.insert(meta.Warnings, handle.Name .. ": " .. tostring(err))
+			end
+		end
+	end
+
+	-- кости — раньше (родители раньше детей), потом остальное
+	table.sort(meta.Entries, function(a, b)
+		return a.Driver.Depth < b.Driver.Depth
+	end)
+
+	for _, message in meta.Warnings do
+		warn("[IKAttach] " .. message)
+	end
+
+	return meta
+end
+
+function module.Bind(rig)
+	if not rig or not rig:IsA("Model") then
+		return nil
+	end
+	return cache[rig] or bind(rig)
+end
+
+function module.Restore(rig)
+	local meta = cache[rig]
+	if not meta then
+		return
+	end
+
+	for _, entry in meta.Entries do
+		pcall(function()
+			entry.Driver:Restore()
+		end)
+	end
+
+	cache[rig] = nil
+end
+
+function module.Rebind(rig)
+	module.Restore(rig)
+	return bind(rig)
+end
+
+-- ============================================================
+-- Публичное API
+-- ============================================================
+function module.GetTargets(rig)
+	local list = {}
+	local meta = module.Bind(rig)
+	if not meta then
+		return list
+	end
+
+	for _, entry in meta.Entries do
+		if entry.Handle.Parent then
+			table.insert(list, entry.Handle)
+		end
+	end
+	for _, handle in meta.Failed do
+		if handle.Parent then
+			table.insert(list, handle)
+		end
+	end
+
+	return list
+end
+
+-- onlyHandles: необязательный набор { [handle] = true }, чтобы не сбрасывать остальные
+function module.ResetControls(rig, onlyHandles)
+	local meta = module.Bind(rig)
+	if not meta then
+		return 0
+	end
+
+	local count = 0
+	for _, entry in meta.Entries do
+		if entry.Handle.Parent and (not onlyHandles or onlyHandles[entry.Handle]) then
+			local ok, rest = pcall(function()
+				return entry.Driver:GetRestWorld()
+			end)
+			if ok and rest then
+				entry.Handle.CFrame = rest
+				count += 1
+			end
+		end
+	end
+
+	return count
+end
+
+function module.SolveRig(rig)
+	local meta = module.Bind(rig)
+	if not meta or #meta.Entries == 0 then
+		return false
+	end
+
+	for _, entry in meta.Entries do
+		local handle = entry.Handle
+		if handle.Parent then
+			if handle:GetAttribute("Enabled") == false then
+				if entry.Driver.Engaged or entry.Driver.Applied then
+					pcall(function()
+						entry.Driver:Restore()
+					end)
+				end
+			else
+				local ok, err = pcall(function()
+					entry.Driver:Solve(handle)
+				end)
+				if not ok then
+					warnOnce("solver '" .. entry.Driver.Name .. "': " .. tostring(err))
+				end
+			end
+		end
+	end
+
+	return true
+end
+
+function module.GetSample(rig)
+	local sample = {}
+	local meta = cache[rig]
+	if not meta then
+		return sample
+	end
+
+	for _, entry in meta.Entries do
+		local key, cf = entry.Driver:GetSampleEntry()
+		if key then
+			sample[key] = cf
+		end
+	end
+
+	return sample
+end
+
+-- информация для Bake: что и как превращать в Pose
+function module.GetPoseInfo(rig)
+	local list = {}
+	local meta = cache[rig]
+	if not meta then
+		return list
+	end
+
+	for _, entry in meta.Entries do
+		local driver = entry.Driver
+		if driver.Kind == "Bone" then
+			table.insert(list, { Key = driver.Target.Name, Kind = "Bone", Bone = driver.Target })
+		elseif driver.Motor and driver.Motor.Parent then
+			table.insert(list, {
+				Key = "__M:" .. driver.Motor:GetFullName(),
+				Kind = "Motor",
+				Motor = driver.Motor,
+			})
+		end
+	end
+
+	return list
+end
+
+-- ---------- Add / Remove ----------
+local function existingTargets(rig)
+	local set = {}
+	for _, descendant in rig:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			local value = descendant:FindFirstChild(CFG.TargetValueName)
+			if value and value:IsA("ObjectValue") and value.Value then
+				set[value.Value] = descendant
+			end
+		end
+	end
+	return set
+end
+
+local function reservedBones(rig)
+	local set = {}
+
+	local spine = getUtil("BoneSpineAdapter")
+	if spine and spine.GetBones then
+		pcall(function()
+			for _, bone in spine.GetBones(rig) do
+				set[bone] = "кость спины (ею управляет BoneSpineAdapter)"
+			end
+		end)
+	end
+
+	local legs = getUtil("BoneLegAdapter")
+	if legs and legs.GetSides then
+		pcall(function()
+			for _, side in legs.GetSides(rig) do
+				if side.Thigh then
+					set[side.Thigh] = "кость руки/ноги (ею управляет BoneLegAdapter)"
+				end
+				if side.Knee then
+					set[side.Knee] = "кость руки/ноги (ею управляет BoneLegAdapter)"
+				end
+			end
+		end)
+	end
+
+	return set
+end
+
+local function validate(rig, item, existing, reserved)
+	if item == rig then
+		return "это сам риг"
+	end
+	if not item:IsDescendantOf(rig) then
+		return "объект вне рига"
+	end
+	if not (item:IsA("BasePart") or item:IsA("Model") or item:IsA("Bone")) then
+		return "поддерживаются BasePart / Model / Bone (а это " .. item.ClassName .. ")"
+	end
+	if item:IsA("BasePart") and isControl(item) then
+		return "это уже контрол/хэндл"
+	end
+	if existing[item] then
+		return "хэндл уже есть: " .. existing[item].Name
+	end
+	if reserved[item] then
+		return reserved[item]
+	end
+	return nil
+end
+
+function module.Add(rig, items)
+	local created, messages = {}, {}
+	local existing = existingTargets(rig)
+	local reserved = reservedBones(rig)
+
+	for _, item in items do
+		local reason = validate(rig, item, existing, reserved)
+		if reason then
+			table.insert(messages, item.Name .. ": " .. reason)
+		else
+			local handle = createHandle(rig, item)
+			existing[item] = handle
+			table.insert(created, handle)
+		end
+	end
+
+	if #created > 0 then
+		module.Rebind(rig)
+
+		local only = {}
+		for _, handle in created do
+			only[handle] = true
+		end
+		module.ResetControls(rig, only)
+	end
+
+	return created, messages
+end
+
+function module.Remove(rig, items)
+	local meta = module.Bind(rig)
+	if not meta then
+		return 0
+	end
+
+	local toDestroy = {}
+
+	for _, item in items do
+		if item:IsA("BasePart") and item:FindFirstChild(CFG.TargetValueName) then
+			toDestroy[item] = true
+		end
+		for _, entry in meta.Entries do
+			if entry.Target == item then
+				toDestroy[entry.Handle] = true
+			end
+		end
+	end
+
+	module.Restore(rig)
+
+	local count = 0
+	for handle in toDestroy do
+		handle:Destroy()
+		count += 1
+	end
+
+	module.Rebind(rig)
+	return count
+end
+
+function module.Diagnose(rig)
+	local meta = module.Bind(rig)
+	if not meta then
+		return
+	end
+
+	print("[IKAttach] диагностика: " .. rig:GetFullName())
+	if #meta.Entries == 0 then
+		print("  подключений нет (выдели объекты и нажми Add IK Handle)")
+	end
+
+	for _, entry in meta.Entries do
+		for _, line in entry.Driver:Describe() do
+			print("  " .. line)
+		end
+		print("    хэндл: " .. entry.Handle:GetFullName())
+	end
+	for _, message in meta.Warnings do
+		print("  ! " .. message)
+	end
+end
+
+return module

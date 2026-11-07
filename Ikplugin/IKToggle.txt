@@ -25,12 +25,14 @@ local toolbar = global.toolbar
 local guiUtil = global.utils.Gui
 local Adapter = global.utils.BoneLegAdapter
 local SpineAdapter = global.utils.BoneSpineAdapter
+local Attach = global.utils.IKAttach
 
 local RunService = game:GetService("RunService")
 local SelectionService = game:GetService("Selection")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-print("[IK Toggle] 1.6.0-spine | adapter="
+print("[IK Toggle] 1.7.0-attach | attach=" .. tostring(Attach and Attach.Version or "MISSING")
+	.. " | adapter="
 	.. tostring(Adapter and Adapter.Version or "MISSING")
 	.. " | spine=" .. tostring(SpineAdapter and SpineAdapter.Version or "MISSING"))
 
@@ -94,6 +96,24 @@ local selectSpineButton = toolbar:CreateButton(
 local resetSpineButton = toolbar:CreateButton(
 	"Reset Spine",
 	"Вернуть контролы спины и головы в родное положение",
+	""
+)
+
+local addHandleButton = toolbar:CreateButton(
+	"Add IK Handle",
+	"Подключить выделенные детали / модели / кости к IK (создаст <Имя>_IKHandle)",
+	""
+)
+
+local removeHandleButton = toolbar:CreateButton(
+	"Remove IK Handle",
+	"Убрать IK-хэндлы выделенных объектов (или выделенные хэндлы)",
+	""
+)
+
+local diagnoseButton = toolbar:CreateButton(
+	"IK Diagnose",
+	"Вывести в Output состояние головы и всех подключений (Motor6D Active, разорванные joint'ы, режим)",
 	""
 )
 
@@ -193,6 +213,22 @@ local function setToggleActive(active)
 end
 
 -- ============================================================
+-- Порядок решения: спина+голова -> ноги/руки -> подключённые объекты
+-- (подключённые решаются последними, чтобы следовать за уже посчитанными костями)
+-- ============================================================
+local addMotorPose, addBonePose
+
+local function solveAll(rig)
+	if SpineAdapter then
+		SpineAdapter.SolveRig(rig)
+	end
+	Adapter.SolveRig(rig)
+	if Attach then
+		Attach.SolveRig(rig)
+	end
+end
+
+-- ============================================================
 -- Запись поз костей
 -- ============================================================
 local function cframesDiffer(a, b)
@@ -236,6 +272,12 @@ local function getFullSample(rig)
 		end
 	end
 
+	if Attach then
+		for name, value in Attach.GetSample(rig) do
+			sample[name] = value
+		end
+	end
+
 	return sample
 end
 
@@ -271,10 +313,7 @@ local function startRecording()
 		return
 	end
 
-	if SpineAdapter then
-		SpineAdapter.SolveRig(state.rig)
-	end
-	Adapter.SolveRig(state.rig)
+	solveAll(state.rig)
 
 	recorder.active = true
 	recorder.startClock = os.clock()
@@ -307,6 +346,103 @@ end
 -- ============================================================
 -- Bake
 -- ============================================================
+-- имена цепочки Part0 -> ... -> Part1 по иерархии Motor6D (от корня рига, без самого корня)
+local function motorChainNames(rig, motor, rootName)
+	local names = { motor.Part1.Name }
+	local current = motor.Part0
+	local guard = 0
+
+	while current and guard < 32 do
+		guard += 1
+
+		if current.Name == rootName then
+			return names
+		end
+
+		table.insert(names, 1, current.Name)
+
+		local parentMotor = nil
+		for _, descendant in rig:GetDescendants() do
+			if descendant:IsA("Motor6D") and descendant.Part1 == current then
+				parentMotor = descendant
+				break
+			end
+		end
+
+		if not parentMotor then
+			break
+		end
+		current = parentMotor.Part0
+	end
+
+	-- цепочка до корня не найдена
+	return { motor.Part1.Name }
+end
+
+local function structuralPose(parent, poses, name)
+	local pose = poses[name]
+	if not pose then
+		pose = Instance.new("Pose")
+		pose.Name = name
+		pose.Weight = 0
+		pose.CFrame = CFrame.new()
+		pose.Parent = parent
+		poses[name] = pose
+	end
+	return pose
+end
+
+local motorChainCache = {}
+
+addMotorPose = function(rootPose, poses, motor, value)
+	if not motor.Part0 or not motor.Part1 then
+		return
+	end
+
+	local names = motorChainCache[motor]
+	if not names then
+		names = motorChainNames(state.rig, motor, rootPose.Name)
+		motorChainCache[motor] = names
+	end
+
+	local parent = rootPose
+	for index = 1, #names - 1 do
+		parent = structuralPose(parent, poses, names[index])
+	end
+
+	local name = names[#names]
+	local pose = poses[name]
+	if not pose then
+		pose = Instance.new("Pose")
+		pose.Name = name
+		pose.Parent = parent
+		poses[name] = pose
+	end
+	pose.Weight = 1
+	pose.CFrame = value
+end
+
+addBonePose = function(rootPose, poses, bone, value)
+	local names = {}
+	local current = bone.Parent
+	while current and current:IsA("Bone") do
+		table.insert(names, 1, current.Name)
+		current = current.Parent
+	end
+
+	local parent = rootPose
+	for _, name in names do
+		parent = structuralPose(parent, poses, name)
+	end
+
+	local pose = Instance.new("Pose")
+	pose.Name = bone.Name
+	pose.Weight = 1
+	pose.CFrame = value
+	pose.Parent = parent
+	poses[bone.Name] = pose
+end
+
 local function bakeRecording()
 	stopRecording()
 
@@ -364,6 +500,8 @@ local function bakeRecording()
 			end
 
 			-- Спина: цепочка TorsoBoneRoot -> ... -> TorsoBoneNeck (вложенные позы)
+			local poses = {}
+
 			if SpineAdapter then
 				local parentPose = rootPose
 
@@ -373,17 +511,29 @@ local function bakeRecording()
 					bonePose.Weight = 1
 					bonePose.CFrame = sample.bones[bone.Name] or CFrame.new()
 					bonePose.Parent = parentPose
+					poses[bone.Name] = bonePose
 					parentPose = bonePose
 				end
 
-				-- Голова: поза OffsetPart (Motor6D.Transform), если Motor6D найден
-				local headMotor, headPart = SpineAdapter.GetHeadMotor(state.rig)
-				if headMotor and headPart and sample.bones["__HeadMotor"] then
-					local headPose = Instance.new("Pose")
-					headPose.Name = headPart.Name
-					headPose.Weight = 1
-					headPose.CFrame = sample.bones["__HeadMotor"]
-					headPose.Parent = rootPose
+				-- Голова: поза OffsetPart (Motor6D.Transform).
+				-- Pose должна лежать в иерархии Motor6D (Part0 -> Part1), а не прямо под корнем.
+				local headMotor = SpineAdapter.GetHeadMotor(state.rig)
+				if headMotor and sample.bones["__HeadMotor"] then
+					addMotorPose(rootPose, poses, headMotor, sample.bones["__HeadMotor"])
+				end
+			end
+
+			-- Подключённые объекты (Add IK Handle): кости и Motor6D
+			if Attach then
+				for _, info in Attach.GetPoseInfo(state.rig) do
+					local value = sample.bones[info.Key]
+					if value then
+						if info.Kind == "Motor" then
+							addMotorPose(rootPose, poses, info.Motor, value)
+						elseif info.Kind == "Bone" and not poses[info.Bone.Name] then
+							addBonePose(rootPose, poses, info.Bone, value)
+						end
+					end
 				end
 			end
 
@@ -431,11 +581,8 @@ local function tickSolve()
 		return
 	end
 
-	-- Сначала спина и голова (считают дельты), потом ноги/руки, которые от неё зависят
-	if SpineAdapter then
-		SpineAdapter.SolveRig(state.rig)
-	end
-	Adapter.SolveRig(state.rig)
+	-- Сначала спина и голова (считают дельты), потом ноги/руки, потом подключённые объекты
+	solveAll(state.rig)
 	recordSample(state.rig)
 end
 
@@ -481,6 +628,9 @@ local function stopIK(restore)
 		if SpineAdapter then
 			pcall(SpineAdapter.Restore, state.rig)
 		end
+		if Attach then
+			pcall(Attach.Restore, state.rig)
+		end
 	end
 
 	state.active = false
@@ -514,13 +664,15 @@ local function startIK(rig)
 		return false
 	end
 
+	-- Подключённые объекты (хэндлы <Имя>_IKHandle)
+	if Attach then
+		Attach.Rebind(rig)
+	end
+
 	state.rig = rig
 	state.active = true
 
-	if SpineAdapter then
-		SpineAdapter.SolveRig(rig)
-	end
-	Adapter.SolveRig(rig)
+	solveAll(rig)
 	connectSolvers()
 
 	updateFrames()
@@ -573,6 +725,12 @@ local function selectIkParts()
 
 	if SpineAdapter then
 		for _, part in SpineAdapter.GetTargets(rig) do
+			table.insert(targets, part)
+		end
+	end
+
+	if Attach then
+		for _, part in Attach.GetTargets(rig) do
 			table.insert(targets, part)
 		end
 	end
@@ -679,7 +837,10 @@ local function resetSpineControls()
 	end
 
 	local count = SpineAdapter.ResetControls(rig)
-	print("[IK Toggle] контролов спины/головы сброшено: " .. tostring(count))
+	if Attach then
+		count += Attach.ResetControls(rig)
+	end
+	print("[IK Toggle] контролов спины/головы/подключённых сброшено: " .. tostring(count))
 end
 
 local function resetRootControls()
@@ -691,6 +852,107 @@ local function resetRootControls()
 
 	local count = Adapter.ResetRootControls(rig)
 	print("[IK Toggle] хэндлов корней сброшено: " .. tostring(count))
+end
+
+-- ============================================================
+-- Подключение чего угодно к IK
+-- ============================================================
+local function addHandles()
+	if not Attach then
+		warn("[IK Toggle] Utils/IKAttach не загружен — добавь модуль IKAttach в папку Utils")
+		return
+	end
+
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели объекты внутри рига (Model с Humanoid)")
+		return
+	end
+
+	local items = {}
+	for _, item in SelectionService:Get() do
+		if item ~= rig then
+			table.insert(items, item)
+		end
+	end
+
+	if #items == 0 then
+		warn("[IK Toggle] выдели детали / модели / кости рига, которые хочешь подключить к IK")
+		return
+	end
+
+	if not (state.active and state.rig == rig) then
+		if not startIK(rig) then
+			return
+		end
+	end
+
+	local created, messages = Attach.Add(rig, items)
+
+	for _, message in messages do
+		warn("[IK Toggle] пропущено: " .. message)
+	end
+
+	if #created == 0 then
+		return
+	end
+
+	SelectionService:Set(created)
+
+	print("==============================================")
+	print("[IK Toggle] подключено к IK: " .. #created)
+	for _, handle in created do
+		local value = handle:FindFirstChild("IKTarget")
+		print("  " .. handle.Name .. "  ->  " .. (value and value.Value and value.Value:GetFullName() or "?"))
+	end
+	print("  Двигай хэндлы или добавь их в MoonAnimator (Add Item / 9).")
+	print("  Атрибуты хэндла: FollowBone (за какой костью следовать), Mode (Auto/Motor/Direct), Enabled.")
+	print("==============================================")
+end
+
+local function removeHandles()
+	if not Attach then
+		return
+	end
+
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели хэндл или подключённый объект")
+		return
+	end
+
+	local items = SelectionService:Get()
+	local count = Attach.Remove(rig, items)
+	print("[IK Toggle] хэндлов удалено: " .. tostring(count))
+end
+
+local function diagnose()
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели риг")
+		return
+	end
+
+	print("==============================================")
+	print("[IK Toggle] ДИАГНОСТИКА " .. rig:GetFullName() .. " (IK " .. (state.active and "включён" or "выключен") .. ")")
+
+	if SpineAdapter then
+		local driver = SpineAdapter.GetHeadDriver(rig)
+		if driver then
+			print("  [Голова]")
+			for _, line in driver:Describe() do
+				print("  " .. line)
+			end
+		else
+			print("  [Голова] драйвер не создан (нет OffsetPart / IKAttach / ещё не нажат Toggle IK)")
+		end
+	end
+
+	if Attach then
+		print("  [Подключённые объекты]")
+		Attach.Diagnose(rig)
+	end
+	print("==============================================")
 end
 
 -- ============================================================
@@ -738,6 +1000,18 @@ resetSpineButton.Click:Connect(function()
 	resetSpineControls()
 end)
 
+addHandleButton.Click:Connect(function()
+	addHandles()
+end)
+
+removeHandleButton.Click:Connect(function()
+	removeHandles()
+end)
+
+diagnoseButton.Click:Connect(function()
+	diagnose()
+end)
+
 recordButton.Click:Connect(function()
 	if not Adapter then
 		return
@@ -763,7 +1037,8 @@ ToolController:RegisterEvent(SelectionService.SelectionChanged, function()
 end)
 
 ToolController:BindToUnload(function()
-	stopIK(false)
+	-- при выгрузке плагина возвращаем joint'ы и позы на место
+	pcall(stopIK, true)
 	GlobalFrame = nil
 	LocalFrame = nil
 	Adapter = nil

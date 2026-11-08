@@ -31,7 +31,7 @@ local RunService = game:GetService("RunService")
 local SelectionService = game:GetService("Selection")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-print("[IK Toggle] 1.7.0-attach | attach=" .. tostring(Attach and Attach.Version or "MISSING")
+print("[IK Toggle] 1.8.0-autoattach | attach=" .. tostring(Attach and Attach.Version or "MISSING")
 	.. " | adapter="
 	.. tostring(Adapter and Adapter.Version or "MISSING")
 	.. " | spine=" .. tostring(SpineAdapter and SpineAdapter.Version or "MISSING"))
@@ -105,6 +105,12 @@ local addHandleButton = toolbar:CreateButton(
 	""
 )
 
+local tagButton = toolbar:CreateButton(
+	"Tag IK Parts",
+	"Проставить выделенным объектам атрибуты IKAttach / IKFollowBone / IKMode — при Toggle IK они подключатся автоматически",
+	""
+)
+
 local removeHandleButton = toolbar:CreateButton(
 	"Remove IK Handle",
 	"Убрать IK-хэндлы выделенных объектов (или выделенные хэндлы)",
@@ -149,21 +155,15 @@ end)
 -- ============================================================
 -- Выбор рига
 -- ============================================================
--- "IK" — служебная модель внутри рига (в ней свой Humanoid и контролы).
--- Её нельзя считать ригом, иначе при выделенном хэндле плагин ищет кости не там.
-local function isIkModel(model)
-	return model.Name == "IK" and model.Parent ~= nil and model.Parent:IsA("Model")
-end
-
 local function getRig()
 	for _, item in SelectionService:Get() do
-		if item:IsA("Model") and item:FindFirstChildOfClass("Humanoid") and not isIkModel(item) then
+		if item:IsA("Model") and item:FindFirstChildOfClass("Humanoid") then
 			return item
 		end
 
 		local ancestor = item:FindFirstAncestorOfClass("Model")
 		while ancestor do
-			if ancestor:FindFirstChildOfClass("Humanoid") and not isIkModel(ancestor) then
+			if ancestor:FindFirstChildOfClass("Humanoid") then
 				return ancestor
 			end
 			ancestor = ancestor:FindFirstAncestorOfClass("Model")
@@ -672,6 +672,33 @@ local function startIK(rig)
 
 	-- Подключённые объекты (хэндлы <Имя>_IKHandle)
 	if Attach then
+		-- Автоподключение: цели с атрибутами IKAttach / IKFollowBone / IKMode получают хэндлы сами
+		if Attach.AutoAttach then
+			local autoOk, autoCreated, autoMessages = pcall(Attach.AutoAttach, rig)
+
+			if not autoOk then
+				warn("[IK Toggle] автоподключение: " .. tostring(autoCreated))
+			else
+				for _, message in autoMessages or {} do
+					warn("[IK Toggle] автоподключение пропустило: " .. message)
+				end
+
+				if autoCreated and #autoCreated > 0 then
+					print("[IK Toggle] автоподключено по атрибутам: " .. #autoCreated)
+					for _, handle in autoCreated do
+						local value = handle:FindFirstChild("IKTarget")
+						print(string.format(
+							"  %s  ->  %s  (FollowBone=%s, Mode=%s)",
+							handle.Name,
+							value and value.Value and value.Value:GetFullName() or "?",
+							tostring(handle:GetAttribute("FollowBone") ~= "" and handle:GetAttribute("FollowBone") or "-"),
+							tostring(handle:GetAttribute("Mode"))
+							))
+					end
+				end
+			end
+		end
+
 		Attach.Rebind(rig)
 	end
 
@@ -916,6 +943,54 @@ local function addHandles()
 	print("==============================================")
 end
 
+-- Заранее проставить атрибуты автоподключения (подключится при Toggle IK)
+local function tagParts()
+	if not Attach or not Attach.Tag then
+		warn("[IK Toggle] Utils/IKAttach 1.1.0 не загружен — обнови модуль IKAttach")
+		return
+	end
+
+	local rig = getRig()
+	if not rig then
+		warn("[IK Toggle] выдели объекты внутри рига (Model с Humanoid)")
+		return
+	end
+
+	local items = {}
+	for _, item in SelectionService:Get() do
+		if item ~= rig then
+			table.insert(items, item)
+		end
+	end
+
+	if #items == 0 then
+		warn("[IK Toggle] выдели детали / модели / кости рига, которые должны подключаться при Toggle IK")
+		return
+	end
+
+	local tagged, messages = Attach.Tag(rig, items)
+
+	for _, message in messages do
+		warn("[IK Toggle] пропущено: " .. message)
+	end
+
+	if #tagged == 0 then
+		return
+	end
+
+	print("==============================================")
+	print("[IK Toggle] помечено для автоподключения: " .. #tagged)
+	for _, item in tagged do
+		print("  " .. item:GetFullName())
+	end
+	print("  Атрибуты на каждом объекте (Properties -> Attributes):")
+	print("    IKAttach (bool)      — true = подключить при Toggle IK, false = не подключать")
+	print("    IKFollowBone (string) — имя кости, за которой следовать (например TorsoBoneNeck)")
+	print("    IKMode (string)      — Auto | Motor | Direct")
+	print("  Теперь просто нажми Toggle IK — хэндлы создадутся и подключатся сами.")
+	print("==============================================")
+end
+
 local function removeHandles()
 	if not Attach then
 		return
@@ -1008,6 +1083,10 @@ end)
 
 addHandleButton.Click:Connect(function()
 	addHandles()
+end)
+
+tagButton.Click:Connect(function()
+	tagParts()
 end)
 
 removeHandleButton.Click:Connect(function()

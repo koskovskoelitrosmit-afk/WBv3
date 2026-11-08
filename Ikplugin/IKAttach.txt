@@ -116,15 +116,29 @@ local function attachWithMotor6D(part0, part1, motorName)
 		warn("Ошибка: part0 или part1 не существуют!")
 		return nil 
 	end
+
+	-- 1. Снимаем Anchor с привязываемой детали (иначе мотор будет неактивен)
+	part1.Anchored = false
+
+	-- 2. Ищем и удаляем старые Weld / Motor6D между этими деталями, чтобы не было конфликта
+	for _, child in ipairs(part0:GetChildren()) do
+		if (child:IsA("Weld") or child:IsA("WeldConstraint") or child:IsA("Motor6D")) and child.Part1 == part1 then
+			child:Destroy()
+		end
+	end
+
 	local motor = Instance.new("Motor6D")
 	motor.Name = motorName or "Motor6D"
-	motor.Part0 = part0 -- Основная деталь (родоначальник движения)
-	motor.Part1 = part1 -- Привязываемая деталь
 
-	-- Настраиваем начальное смещение на основе текущего положения деталей в пространстве
-	motor.C0 = part0.CFrame:Inverse() * part1.CFrame
+	-- 3. Сначала настраиваем смещение, а ТОЛЬКО ПОТОМ указываем Part0 и Part1
+	-- Это предотвращает резкий физический рывок в момент привязки
+	motor.C0 = part0.CFrame:ToObjectSpace(part1.CFrame)
+	motor.C1 = CFrame.new() -- Оставляем C1 чистым, так как всё смещение записали в C0
 
-	-- Помещаем Motor6D внутрь Part0 (можно заменить на part1 или модель персонажа)
+	motor.Part0 = part0 
+	motor.Part1 = part1 
+
+	-- 4. Родителя назначаем в самый последний момент
 	motor.Parent = part0
 
 	return motor
@@ -967,6 +981,9 @@ local function createHandle(rig, item, settings)
 		HM.Name = "Humanoid"
 		local IKRoot = rig.HumanoidRootPart:Clone()
 		IKRoot.Parent = IkModel
+		if IKRoot:FindFirstChild("Root") then
+			IKRoot:FindFirstChild("Root"):Destroy()
+		end
 		IkModel.PrimaryPart =IKRoot
 	end
 	while IkModel:FindFirstChild(name) do

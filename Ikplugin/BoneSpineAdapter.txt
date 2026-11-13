@@ -11,7 +11,7 @@
                               поворот = скрут/наклон верха груди.
         SpineLumbarControl  — поясница (TorsoBone.001). Смещение от родного места = изгиб спины
                               (прогиб вперёд/назад/вбок), цепочка проходит через эту точку.
-        HeadControl         — OffsetPart головы (НЕ сама голова). Двигается Motor6D.Transform
+        HeadControl         — OffsetPart головы (НЕ сама голова). Двигается через Utils/IKAttach (Motor6D.Transform / Direct)
                               (Motor6D_OffsetPart), следует за шеей + собственное смещение хэндла.
 
     Зависимости других цепочек от спины:
@@ -38,57 +38,11 @@ module.Config = {
 	-- смещения меньше этого значения (в studs) считаются нулевыми
 	Epsilon = 0.0005,
 
-	Spine = {
-		Chain = {
-			"TorsoBoneRoot",
-			"TorsoBone",
-			"TorsoBone.001",
-			"TorsoBone.002",
-			"TorsoBone.003",
-			"TorsoBoneNeck",
-		},
-		-- кость поясницы, через которую проходит изгиб
-		Lumbar = "TorsoBone.001",
-
-		Base = "SpineBaseControl",
-		Target = "SpineTarget",
-		LumbarControl = "SpineLumbarControl",
-
-		-- true  = поворот таргета/основы скручивает позвоночник по длине
-		Twist = true,
-
-		-- true  = поясница в приоритете: если цепочка натянута, шея недотягивается до таргета,
-		--         но поясница встаёт ровно туда, куда её увели.
-		-- false = таргет шеи в приоритете: изгиб ограничен запасом длины цепочки.
-		LumbarPriority = true,
-	},
-
-	Head = {
-		Enabled = true,
-		Control = "HeadControl",
-		-- имя двигаемой детали (она лежит в модели Head)
-		Part = "OffsetPart",  ---OffsetPart
-		
-		-- имя Motor6D, который держит OffsetPart (если не найден по имени, ищется по Part0/Part1)
-		Motor = "Motor6D_OffsetPart", -----Motor6D_OffsetPart
-		-- кость, за которой следует голова
-		FollowBone = "TorsoBoneNeck",
-		-- true = дополнительно ставить OffsetPart.CFrame напрямую (если Motor6D не двигает деталь в edit-режиме).
-		-- ОСТОРОЖНО: может утащить всю сборку. По умолчанию выключено.
-		ForceCFrame = false,
-	},
-
-	-- от каких костей спины зависят основы ног и рук (читает BoneLegAdapter)
-	Anchors = {
-		Leg = "TorsoBoneRoot",
-		Arm = "TorsoBone.003",
-	},
-
 	Sizes = {
-		Base = 0.7,
-		Target = 0.6,
-		Lumbar = 0.55,
-		Head = 0.6,
+		Base = 0.9,
+		Target = 0.8,
+		Lumbar = 0.8,
+		Head = 0.8,
 	},
 
 	Colors = {
@@ -108,32 +62,48 @@ local warned = {}
 -- ============================================================
 -- Утилиты
 -- ============================================================
--- Функция для привязки объектов через Motor6D
-local function attachWithMotor6D(part0, part1, motorName)
-	if not part0 or not part1 then 
-		warn("Ошибка: part0 или part1 не существуют!")
-		return nil 
-	end
-	local motor = Instance.new("Motor6D")
-	motor.Name = motorName or "Motor6D"
-	motor.Part0 = part0 -- Основная деталь (родоначальник движения)
-	motor.Part1 = part1 -- Привязываемая деталь
-
-	-- Настраиваем начальное смещение на основе текущего положения деталей в пространстве
-	motor.C0 = part0.CFrame:Inverse() * part1.CFrame
-
-	-- Помещаем Motor6D внутрь Part0 (можно заменить на part1 или модель персонажа)
-	motor.Parent = part0
-
-	return motor
+local function GetConfig(Rig)
+	local Config = require(Rig:WaitForChild("Config"))
+    return Config
 end
-
 local function warnOnce(message)
 	if warned[message] then
 		return
 	end
 	warned[message] = true
 	warn("[BoneSpineAdapter] " .. tostring(message))
+end
+local function attachWithMotor6D(part0, part1, motorName)
+	if not part0 or not part1 then 
+		warn("Ошибка: part0 или part1 не существуют!")
+		return nil 
+	end
+
+	-- 1. Снимаем Anchor с привязываемой детали (иначе мотор будет неактивен)
+	part1.Anchored = false
+
+	-- 2. Ищем и удаляем старые Weld / Motor6D между этими деталями, чтобы не было конфликта
+	for _, child in ipairs(part0:GetChildren()) do
+		if (child:IsA("Weld") or child:IsA("WeldConstraint") or child:IsA("Motor6D")) and child.Part1 == part1 then
+			child:Destroy()
+		end
+	end
+
+	local motor = Instance.new("Motor6D")
+	motor.Name = motorName or "Motor6D"
+
+	-- 3. Сначала настраиваем смещение, а ТОЛЬКО ПОТОМ указываем Part0 и Part1
+	-- Это предотвращает резкий физический рывок в момент привязки
+	motor.C0 = part0.CFrame:ToObjectSpace(part1.CFrame)
+	motor.C1 = CFrame.new() -- Оставляем C1 чистым, так как всё смещение записали в C0
+
+	motor.Part0 = part0 
+	motor.Part1 = part1 
+
+	-- 4. Родителя назначаем в самый последний момент
+	motor.Parent = part0
+
+	return motor
 end
 
 local function unit(vector)
@@ -263,15 +233,20 @@ local function getControl(rig, name)
 	return nil
 end
 
+
+
+
+
 -- ============================================================
 -- Bind: спина
 -- ============================================================
 local function bindSpine(rig, meta)
-	local cfg = CFG.Spine
+	local config = GetConfig(rig)
+	
 	local bones = {}
 	local previous = nil
-
-	for index, name in cfg.Chain do
+    
+	for index, name in config.SpineChain do
 		local bone = previous and previous:FindFirstChild(name, true) or findBone(rig, name)
 
 		if not bone or not bone:IsA("Bone") then
@@ -332,7 +307,7 @@ local function bindSpine(rig, meta)
 		fractions[index] = run / chainLength
 	end
 
-	local lumbarIndex = table.find(cfg.Chain, cfg.Lumbar) or math.floor((n + 1) / 2)
+	local lumbarIndex = table.find(config.SpineChain, config.Lumbar) or math.floor((n + 1) / 2)
 	local lumbarFraction = math.clamp(fractions[lumbarIndex] or 0.5, 0.15, 0.85)
 	local bumpNorm = math.max(math.sin(math.pi * lumbarFraction), 0.2)
 
@@ -353,13 +328,116 @@ local function bindSpine(rig, meta)
 		Index = indexByName,
 	}
 end
+-- ============================================================
+-- Bind: Dk
+-- ============================================================
+local function bindDk(rig, meta)
+	local config = GetConfig(rig)
+	
+	local bones = {}
+	local previous = nil
 
+	for index, name in config.DkChain do
+		local bone = previous and previous:FindFirstChild(name, true) or findBone(rig, name)
+
+		if not bone or not bone:IsA("Bone") then
+			table.insert(meta.Warnings, "Dk: не найдена кость " .. name)
+			return nil
+		end
+
+		bones[index] = bone
+		previous = bone
+	end
+
+	if #bones < 4 then
+		table.insert(meta.Warnings, "Dk: в цепочке должно быть минимум 4 кости")
+		return nil
+	end
+
+	local mesh = meshOf(bones[1])
+	if not mesh then
+		table.insert(meta.Warnings, "Dk: не найден MeshPart для " .. bones[1].Name)
+		return nil
+	end
+
+	for _, bone in bones do
+		bone.Transform = CFrame.new()
+	end
+
+	local n = #bones
+	local localCF = {}
+	local lengths = {}
+
+	for index, bone in bones do
+		localCF[index] = localRest(bone, mesh)
+
+		if index > 1 and bone.Parent ~= bones[index - 1] then
+			table.insert(
+				meta.Warnings,
+				"Dk: " .. bone.Name .. " не прямой ребёнок " .. bones[index - 1].Name
+					.. " (позы могут чуть расходиться)"
+			)
+		end
+	end
+
+	for index = 1, n - 1 do
+		lengths[index] = math.max((localCF[index + 1].Position - localCF[index].Position).Magnitude, 0.001)
+	end
+
+	-- доли длины вдоль цепочки 2..n (кость 1 — жёсткий таз)
+	local chainLength = 0
+	for index = 2, n - 1 do
+		chainLength += lengths[index]
+	end
+
+	local fractions = {}
+	local run = 0
+	fractions[2] = 0
+	for index = 3, n do
+		run += lengths[index - 1]
+		fractions[index] = run / chainLength
+	end
+
+	local DKMediumIndex = table.find(config.DkChain, config.DKMedium) or math.floor((n + 1) / 2)
+	local DKMediumFraction = math.clamp(fractions[DKMediumIndex] or 0.5, 0.15, 0.85)
+	local bumpNorm = math.max(math.sin(math.pi * DKMediumFraction), 0.2)
+
+	local indexByName = {}
+	for index, bone in bones do
+		indexByName[bone.Name] = index
+	end
+
+	return {
+		Bones = bones,
+		Mesh = mesh,
+		LocalCF = localCF,
+		Lengths = lengths,
+		ChainLength = chainLength,
+		Fractions = fractions,
+		DKMediumIndex = DKMediumIndex,
+		BumpNorm = bumpNorm,
+		Index = indexByName,
+	}
+end
 -- ============================================================
 -- Bind: голова (OffsetPart)
 -- ============================================================
+local function getAttach()
+	local global = shared._IKRigGlobal
+	return global and global.utils and global.utils.IKAttach or nil
+end
+
 local function bindHead(rig, meta)
-	local cfg = CFG.Head
+	local config = GetConfig(rig)
+
+	local cfg = config.Head
 	if not cfg.Enabled then
+		return nil
+	end
+
+	local Attach = getAttach()
+	if not Attach then
+		table.insert(meta.Warnings, "Head: Utils/IKAttach не загружен (добавь модуль IKAttach в Utils)")
 		return nil
 	end
 
@@ -376,45 +454,43 @@ local function bindHead(rig, meta)
 		return nil
 	end
 
-	local motor = nil
-	for _, descendant in rig:GetDescendants() do
-		if descendant:IsA("Motor6D") and (descendant.Part1 == part or descendant.Part0 == part) then
-			if not motor or descendant.Name == cfg.Motor then
-				motor = descendant
-			end
-		end
-	end
-
-	local restWorld
-	local motorIsPart1 = true
-
-	if motor then
-		--print(motor)
-		--print(part)
-		motor.Transform = CFrame.new()
-		motorIsPart1 = motor.Part1 == part
-
-		if motorIsPart1 then
-			restWorld = motor.Part0.CFrame * motor.C0 * motor.C1:Inverse()
-		else
-			restWorld = motor.Part1.CFrame * motor.C1 * motor.C0:Inverse()
-		end
-	else
-		restWorld = part.CFrame
-		table.insert(meta.Warnings, "Head: Motor6D для " .. cfg.Part .. " не найден, голова будет ставиться через CFrame")
-	end
-
 	local reference = meta.Spine and meta.Spine.Mesh or getRoot(rig)
 	if not reference then
 		return nil
 	end
 
+	local mode = cfg.Mode or "Auto"
+	if cfg.ForceCFrame then
+		mode = "Direct"
+	end
+
+	local driver, err = Attach.NewDriver(rig, {
+		Target = part,
+		Reference = reference,
+		Mode = mode,
+		MotorHint = cfg.Motor,
+		Name = "Head(" .. part.Name .. ")",
+		-- дельта шеи считается спиной в этом же тике
+		FollowDelta = function()
+			return meta.Deltas[cfg.FollowBone]
+		end,
+	})
+
+	if not driver then
+		table.insert(meta.Warnings, "Head: " .. tostring(err))
+		return nil
+	end
+
+	if not driver.Motor then
+		table.insert(meta.Warnings, "Head: Motor6D для " .. cfg.Part .. " не найден, голова будет двигаться напрямую (Direct)")
+	end
+
 	return {
 		Part = part,
-		Motor = motor,
-		MotorIsPart1 = motorIsPart1,
+		Motor = driver.Motor,
+		Driver = driver,
 		Reference = reference,
-		LocalRest = reference.CFrame:ToObjectSpace(restWorld),
+		LocalRest = driver.LocalRest,
 	}
 end
 
@@ -424,16 +500,20 @@ local function bind(rig)
 		Warnings = {},
 		Deltas = {},
 		Spine = nil,
+		Dk = nil,
 		Head = nil,
 		Enabled = false,
 	}
 
 	if CFG.Enabled then
 		meta.Spine = bindSpine(rig, meta)
+		if  GetConfig(rig).RigType == "Man" then
+			meta.Dk = bindDk(rig, meta)
+		end
 		meta.Head = bindHead(rig, meta)
 	end
 
-	meta.Enabled = meta.Spine ~= nil or meta.Head ~= nil
+	meta.Enabled = meta.Spine ~= nil or meta.Head ~= nil or meta.Dk ~= nil
 	cache[rig] = meta
 	return meta
 end
@@ -446,6 +526,14 @@ function module.Bind(rig)
 end
 
 function module.Rebind(rig)
+	-- если старый драйвер головы ещё держит joint'ы отключёнными — возвращаем всё как было
+	local old = cache[rig]
+	if old and old.Head and old.Head.Driver then
+		pcall(function()
+			old.Head.Driver:Restore()
+		end)
+	end
+
 	cache[rig] = nil
 	return bind(rig)
 end
@@ -453,6 +541,11 @@ end
 function module.IsSpineRig(rig)
 	local meta = module.Bind(rig)
 	return meta ~= nil and meta.Spine ~= nil
+end
+function module.IsDkRig(rig)
+
+	local meta = module.Bind(rig)
+	return meta ~= nil and meta.Dk ~= nil
 end
 
 -- ============================================================
@@ -471,9 +564,19 @@ function module.Restore(rig)
 			end
 		end
 	end
-
-	if meta.Head and meta.Head.Motor and meta.Head.Motor.Parent then
-		meta.Head.Motor.Transform = CFrame.new()
+	if  GetConfig(rig).RigType == "Man" then
+		if meta.Dk then
+			for _, bone in meta.Dk.Bones do
+				if bone.Parent then
+					bone.Transform = CFrame.new()
+				end
+			end
+		end
+	end
+	if meta.Head and meta.Head.Driver then
+		pcall(function()
+			meta.Head.Driver:Restore()
+		end)
 	end
 
 	meta.Deltas = {}
@@ -493,7 +596,17 @@ local function restPositions(meta)
 		result.Target = CFrame.new((mc * sp.LocalCF[n]).Position) * rotation
 		result.Lumbar = CFrame.new((mc * sp.LocalCF[sp.LumbarIndex]).Position) * rotation
 	end
+	
+	if meta.Dk   then
+		local sp = meta.Dk
+		local mc = sp.Mesh.CFrame
+		local n = #sp.Bones
+		local rotation = mc.Rotation
 
+		result.DKBase = CFrame.new((mc * sp.LocalCF[1]).Position) * rotation
+		result.DKTarget = CFrame.new((mc * sp.LocalCF[n]).Position) * rotation
+		result.DKMedium = CFrame.new((mc * sp.LocalCF[sp.DKMediumIndex]).Position) * rotation
+	end
 	if meta.Head then
 		result.Head = meta.Head.Reference.CFrame * meta.Head.LocalRest
 	end
@@ -517,11 +630,17 @@ function module.ResetControls(rig)
 			count += 1
 		end
 	end
-
-	reset(CFG.Spine.Base, rest.Base)
-	reset(CFG.Spine.Target, rest.Target)
-	reset(CFG.Spine.LumbarControl, rest.Lumbar)
-	reset(CFG.Head.Control, rest.Head)
+	local config = GetConfig(rig)
+	reset(config.Base, rest.Base)
+	reset(config.Target, rest.Target)
+	reset(config.LumbarControl, rest.Lumbar)
+	
+	if  config.RigType == "Man" then
+	reset(config.DKBase, rest.DKBase)
+	reset(config.DKTarget, rest.DKTarget)
+	reset(config.DKMediumControl, rest.DKMedium)
+	end
+	reset(config.Head.Control, rest.Head)
 
 	return count
 end
@@ -565,11 +684,14 @@ local function ensureControl(rig, name, cframe, color, size, shape)
 		local HM = Instance.new("Humanoid",IkModel)
 		HM.Name = "Humanoid"
 		local IKRoot = rig.HumanoidRootPart:Clone()
+		
 		IKRoot.Parent = IkModel
+		if IKRoot:FindFirstChild("Root") then
+			IKRoot:FindFirstChild("Root"):Destroy()
+		end
 		IkModel.PrimaryPart =IKRoot
 	end
 	local existing = IkModel:FindFirstChild(name)
-
 	if existing then
 		if not existing:IsA("BasePart") then
 			return nil, name .. " занято объектом " .. existing.ClassName
@@ -600,13 +722,11 @@ local function ensureControl(rig, name, cframe, color, size, shape)
 	part.CFrame = cframe
 	part.Parent = IkModel
 	addLabel(part)
-
 	if autopodviazka ==true then
-		print(part.Name.."привязал")
+
 		attachWithMotor6D(IkModel.HumanoidRootPart,part,part.Name)
-    end
-	
-	
+	end
+
 	return part, true
 end
 
@@ -633,20 +753,31 @@ function module.EnsureControls(rig)
 		end
 		return true
 	end
-
+	local config = GetConfig(rig)
 	if meta.Spine then
-		local ok, err = make(CFG.Spine.Base, rest.Base, CFG.Colors.Base, CFG.Sizes.Base, Enum.PartType.Block)
+	
+		local ok, err = make(config.Base, rest.Base, CFG.Colors.Base, CFG.Sizes.Base, Enum.PartType.Block)
 		if not ok then return false, err end
 
-		ok, err = make(CFG.Spine.Target, rest.Target, CFG.Colors.Target, CFG.Sizes.Target, Enum.PartType.Ball)
+		ok, err = make(config.Target, rest.Target, CFG.Colors.Target, CFG.Sizes.Target, Enum.PartType.Ball)
 		if not ok then return false, err end
 
-		ok, err = make(CFG.Spine.LumbarControl, rest.Lumbar, CFG.Colors.Lumbar, CFG.Sizes.Lumbar, Enum.PartType.Cylinder)
+		ok, err = make(config.LumbarControl, rest.Lumbar, CFG.Colors.Lumbar, CFG.Sizes.Lumbar, Enum.PartType.Cylinder)
 		if not ok then return false, err end
 	end
+	if meta.Dk and config.RigType == "Man"  then
 
+		local ok, err = make(config.DKBase, rest.DKBase, CFG.Colors.Base, CFG.Sizes.Base, Enum.PartType.Block)
+		if not ok then return false, err end
+
+		ok, err = make(config.DKTarget, rest.DKTarget, CFG.Colors.Target, CFG.Sizes.Target, Enum.PartType.Ball)
+		if not ok then return false, err end
+
+		ok, err = make(config.DKMediumControl, rest.DKMedium, CFG.Colors.Lumbar, CFG.Sizes.Lumbar, Enum.PartType.Cylinder)
+		if not ok then return false, err end
+	end
 	if meta.Head then
-		local ok, err = make(CFG.Head.Control, rest.Head, CFG.Colors.Head, CFG.Sizes.Head, Enum.PartType.Block)
+		local ok, err = make(config.Head.Control, rest.Head, CFG.Colors.Head, CFG.Sizes.Head, Enum.PartType.Block)
 		if not ok then return false, err end
 	end
 
@@ -659,6 +790,9 @@ function module.EnsureControls(rig)
 	end
 
 	rig:SetAttribute("BoneSpineReady", true)
+	if  config.RigType == "Man" then
+		rig:SetAttribute("BoneDkReady", true)
+	end
 
 	print("[Bone Spine] контролы готовы, новых объектов: " .. created)
 	if meta.Spine then
@@ -666,19 +800,12 @@ function module.EnsureControls(rig)
 			"  Spine: %s -> %s | base=%s | target=%s | lumbar=%s",
 			meta.Spine.Bones[1].Name,
 			meta.Spine.Bones[#meta.Spine.Bones].Name,
-			CFG.Spine.Base,
-			CFG.Spine.Target,
-			CFG.Spine.LumbarControl
+			config.Base,
+			config.Target,
+			config.LumbarControl
 			))
 	end
-	if meta.Head then
-		print(string.format(
-			"  Head: %s | motor=%s | control=%s",
-			meta.Head.Part.Name,
-			meta.Head.Motor and meta.Head.Motor.Name or "НЕТ (через CFrame)",
-			CFG.Head.Control
-			))
-	end
+
 	for _, warning in meta.Warnings do
 		warn("[Bone Spine] " .. warning)
 	end
@@ -699,20 +826,26 @@ function module.GetTargets(rig)
 			table.insert(list, part)
 		end
 	end
-
+	local config = GetConfig(rig)
 	if meta.Spine then
-		add(CFG.Spine.Base)
-		add(CFG.Spine.LumbarControl)
-		add(CFG.Spine.Target)
+		add(config.Base)
+		add(config.LumbarControl)
+		add(config.Target)
+	end
+	if meta.Dk and config.RigType == "Man"  then
+		add(config.DKBase)
+		add(config.DKMediumControl)
+		add(config.DKTarget)
 	end
 	if meta.Head then
-		add(CFG.Head.Control)
+		add(config.Head.Control)
 	end
+
 
 	return list
 end
 
-function module.GetBones(rig)
+function module.GetBones(rig)   ---- ?
 	local meta = module.Bind(rig)
 	if meta and meta.Spine then
 		return meta.Spine.Bones
@@ -730,16 +863,19 @@ function module.GetDelta(rig, boneName)
 	return meta.Deltas[boneName]
 end
 
-function module.GetAnchorName(kind)
-	return kind == "Arm" and CFG.Anchors.Arm or CFG.Anchors.Leg
+function module.GetAnchorName(kind,rig)
+	local config = GetConfig(rig)
+	return kind == "Arm" and config.Anchors.Arm or config.Anchors.Leg
 end
 
 -- ============================================================
 -- Решатель спины
 -- ============================================================
 local function solveSpine(rig, meta)
+	local config = GetConfig(rig)
 	local sp = meta.Spine
-	local cfg = CFG.Spine
+	
+	local cfg = config
 	local mesh = sp.Mesh
 
 	if not mesh.Parent then
@@ -759,9 +895,9 @@ local function solveSpine(rig, meta)
 		RR[index] = cf.Rotation
 	end
 
-	local baseControl = getControl(rig, cfg.Base)
-	local targetControl = getControl(rig, cfg.Target)
-	local lumbarControl = getControl(rig, cfg.LumbarControl)
+	local baseControl = getControl(rig.IK, cfg.Base)
+	local targetControl = getControl(rig.IK, cfg.Target)
+	local lumbarControl = getControl(rig.IK, cfg.LumbarControl)
 
 	-- основа (бёдра)
 	local basePosition = R[1]
@@ -933,59 +1069,220 @@ local function solveSpine(rig, meta)
 		meta.Deltas[bone.Name] = posedCF * restCF:Inverse()
 	end
 end
+-- ============================================================
+-- Решатель dk
+-- ============================================================
+local function solveDk(rig, meta)
+	local config = GetConfig(rig)
+	local dk = meta.Dk
+
+	local cfg = config
+	local mesh = dk.Mesh
+
+	if not mesh.Parent then
+		return
+	end
+
+	local mc = mesh.CFrame
+	local mcRotation = mc.Rotation
+	local n = #dk.Bones
+	local eps = CFG.Epsilon
+
+	-- rest-поза в мире
+	local R, RR = {}, {}
+	for index = 1, n do
+		local cf = mc * dk.LocalCF[index]
+		R[index] = cf.Position
+		RR[index] = cf.Rotation
+	end
+
+	local baseControl = getControl(rig.IK, cfg.DKBase)
+	local targetControl = getControl(rig.IK, cfg.DKTarget)
+	local DKMediumControl = getControl(rig.IK, cfg.DKMediumControl)
+
+	-- основа (бёдра)
+	local basePosition = R[1]
+	local baseRotation = CFrame.new()
+
+	if baseControl then
+		local offset = baseControl.Position - R[1]
+		if offset.Magnitude >= eps then
+			basePosition = R[1] + offset
+		end
+		baseRotation = baseControl.CFrame.Rotation * mcRotation:Inverse()
+	end
+
+	-- таргет (шея)
+	local targetPosition = R[n]
+	local targetRotation = CFrame.new()
+
+	if targetControl then
+		targetPosition = targetControl.Position
+		targetRotation = targetControl.CFrame.Rotation * mcRotation:Inverse()
+	end
+
+	-- поясница: смещение от родного места
+	local bulge = Vector3.zero
+
+	if DKMediumControl then
+		local offset = DKMediumControl.Position - R[dk.DKMediumIndex]
+		if offset.Magnitude >= eps then
+			bulge = offset
+		end
+	end
+
+	-- Кость 1 (таз) жёсткая: двигается и вращается с SpineBaseControl.
+	-- Остальная цепочка 2..n решается FABRIK от конца таза до таргета.
+	local p = {}
+	p[1] = basePosition
+	p[2] = basePosition + baseRotation:VectorToWorldSpace(R[2] - R[1])
+
+	local base = p[2]
+	local toTarget = targetPosition - base
+	local distance = toTarget.Magnitude
+	local maxReach = dk.ChainLength * 0.9995
+	local reachedTarget = targetPosition
+
+	if distance > maxReach and distance > 0.0001 then
+		reachedTarget = base + toTarget.Unit * maxReach
+	end
+
+	-- начальное приближение: родная кривизна + изгиб от поясницы
+	local chordRest = R[n] - R[2]
+	local chordNew = reachedTarget - base
+	local chordSwing = swing(chordRest, chordNew)
+
+	for index = 2, n do
+		local f = dk.Fractions[index]
+		local restPoint = R[2] + chordRest * f
+		local deviation = R[index] - restPoint
+		local bump = math.sin(math.pi * f) / dk.BumpNorm
+
+		p[index] = base + chordNew * f + chordSwing:VectorToWorldSpace(deviation) + bulge * bump
+	end
+
+	-- FABRIK: длины костей сохраняются. Участок [a..b]: p[a] фиксирован, p[b] тянется к goal.
+	local lengths = dk.Lengths
+
+	local function fabrik(a, b, goal)
+		local anchor = p[a]
+
+		for _ = 1, CFG.Iterations do
+			p[b] = goal
+
+			for index = b - 1, a, -1 do
+				local d = p[index] - p[index + 1]
+				local dir = unit(d) or unit(R[index] - R[index + 1]) or Vector3.yAxis
+				p[index] = p[index + 1] + dir * lengths[index]
+			end
+
+			p[a] = anchor
+
+			for index = a + 1, b do
+				local d = p[index] - p[index - 1]
+				local dir = unit(d) or unit(R[index] - R[index - 1]) or Vector3.yAxis
+				p[index] = p[index - 1] + dir * lengths[index - 1]
+			end
+		end
+	end
+
+	local DKMediumIndex = dk.DKMediumIndex
+
+	if cfg.DKMediumPriority and DKMediumIndex > 2 and DKMediumIndex < n then
+		-- Поясница имеет приоритет: сначала таз -> поясница, потом поясница -> шея.
+		-- Если цепочка натянута, шея недотянется до таргета, а поясница окажется там, куда её увели.
+		local DKMediumGoal = p[DKMediumIndex]
+
+		local lowerLength = 0
+		for index = 2, DKMediumIndex - 1 do
+			lowerLength += lengths[index]
+		end
+
+		local toLumbar = DKMediumGoal - base
+		local lumbarDistance = toLumbar.Magnitude
+		if lumbarDistance > lowerLength * 0.9995 and lumbarDistance > 0.0001 then
+			DKMediumGoal = base + toLumbar.Unit * lowerLength * 0.9995
+		end
+
+		fabrik(2, DKMediumIndex, DKMediumGoal)
+
+		local upperLength = 0
+		for index = DKMediumIndex, n - 1 do
+			upperLength += lengths[index]
+		end
+
+		local upperBase = p[DKMediumIndex]
+		local toNeck = reachedTarget - upperBase
+		local neckDistance = toNeck.Magnitude
+		local neckGoal = reachedTarget
+		if neckDistance > upperLength * 0.9995 and neckDistance > 0.0001 then
+			neckGoal = upperBase + toNeck.Unit * upperLength * 0.9995
+		end
+
+		fabrik(DKMediumIndex, n, neckGoal)
+	else
+		fabrik(2, n, reachedTarget)
+	end
+
+	-- мировые повороты костей
+	local Q = {}
+	Q[1] = baseRotation * RR[1]
+
+	for index = 2, n - 1 do
+		local restDirection = R[index + 1] - R[index]
+		local direction = p[index + 1] - p[index]
+		local q = swing(restDirection, direction) * RR[index]
+
+		if cfg.Twist then
+			local axis = unit(direction)
+			if axis then
+				local f = dk.Fractions[index]
+				local angle = twistAngle(targetRotation, axis) * f + twistAngle(baseRotation, axis) * (1 - f)
+				if math.abs(angle) > 1e-4 then
+					q = CFrame.fromAxisAngle(axis, angle) * q
+				end
+			end
+		end
+
+		Q[index] = q
+	end
+
+	Q[n] = targetRotation * RR[n]
+
+	-- Bone.Transform и дельты
+	for index = 1, n do
+		local transform
+
+		if index == 1 then
+			local localOffset = RR[1]:VectorToObjectSpace(basePosition - R[1])
+			transform = CFrame.new(localOffset) * (RR[1]:Inverse() * Q[1])
+		else
+			-- мировая ориентация rest-системы кости после финальной позы родителя
+			local frame = Q[index - 1] * RR[index - 1]:Inverse() * RR[index]
+			transform = frame:Inverse() * Q[index]
+		end
+
+		local bone = dk.Bones[index]
+		bone.Transform = transform
+
+		local restCF = CFrame.new(R[index]) * RR[index]
+		local posedCF = CFrame.new(p[index]) * Q[index]
+		meta.Deltas[bone.Name] = posedCF * restCF:Inverse()
+	end
+end
 
 -- ============================================================
 -- Решатель головы (OffsetPart)
 -- ============================================================
 local function solveHead(rig, meta)
-	--print("HEADSTART")
+	local config = GetConfig(rig)
 	local head = meta.Head
 	if not head.Part.Parent or not head.Reference.Parent then
 		return
 	end
 
-	local eps = CFG.Epsilon
-	local restWorld = head.Reference.CFrame * head.LocalRest
-
-	-- голова следует за шеей
-	local followed = restWorld
-	local neckDelta = meta.Deltas[CFG.Head.FollowBone]
-	if neckDelta then
-		followed = neckDelta * restWorld
-	end
-
-	local final = followed
-	local control = getControl(rig, CFG.Head.Control)
-
-	if control then
-		local offset = control.Position - restWorld.Position
-		if offset.Magnitude < eps then
-			offset = Vector3.zero
-		end
-
-		local rotationDelta = control.CFrame.Rotation * restWorld.Rotation:Inverse()
-		final = CFrame.new(followed.Position + offset) * rotationDelta * followed.Rotation
-	end
-    --print(final)
-	local motor = head.Motor
-	--print(motor)
-	--print(head.Part)
-	if motor and motor.Parent and motor.Part0 and motor.Part1 then
-		if head.MotorIsPart1 then
-			motor.Transform = (motor.Part0.CFrame * motor.C0):Inverse() * final * motor.C1
-			--print(motor.Transform)
-		else
-			motor.Transform = motor.C0:Inverse() * final:Inverse() * motor.Part1.CFrame * motor.C1
-			--print(motor.Transform)
-		end
-
-		if CFG.Head.ForceCFrame then
-			head.Part.CFrame = final
-		end
-	else
-	--	print("на похуй мимо касы")
-		head.Part.CFrame = final
-	end
+	-- следует за шеей (FollowDelta) + смещение хэндла HeadControl
+	head.Driver:Solve(getControl(rig.IK, config.Head.Control))
 end
 
 function module.SolveRig(rig)
@@ -1002,7 +1299,12 @@ function module.SolveRig(rig)
 			warnOnce("spine solver: " .. tostring(err))
 		end
 	end
-
+	if meta.Dk and GetConfig(rig).RigType == "Man"  then
+		local ok, err = pcall(solveDk, rig, meta)
+		if not ok then
+			warnOnce("spine solver: " .. tostring(err))
+		end
+	end
 	if meta.Head then
 		--print("Голова настроена")
 		local ok, err = pcall(solveHead, rig, meta)
@@ -1035,6 +1337,14 @@ function module.GetSample(rig)
 	end
 
 	return sample
+end
+
+function module.GetHeadDriver(rig)
+	local meta = module.Bind(rig)
+	if meta and meta.Head then
+		return meta.Head.Driver
+	end
+	return nil
 end
 
 function module.GetHeadMotor(rig)

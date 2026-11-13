@@ -27,6 +27,7 @@ local Adapter = global.utils.BoneLegAdapter
 local SpineAdapter = global.utils.BoneSpineAdapter
 local Attach = global.utils.IKAttach
 
+local BoneHandle = global.utils.IKBoneHandle 
 local RunService = game:GetService("RunService")
 local SelectionService = game:GetService("Selection")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -232,6 +233,9 @@ local function solveAll(rig)
 	if Attach then
 		Attach.SolveRig(rig)
 	end
+	if BoneHandle then                                  -- НОВОЕ
+		BoneHandle.SolveRig(rig)
+	end
 end
 
 -- ============================================================
@@ -280,6 +284,11 @@ local function getFullSample(rig)
 
 	if Attach then
 		for name, value in Attach.GetSample(rig) do
+			sample[name] = value
+		end
+	end
+	if BoneHandle then                                  -- НОВОЕ
+		for name, value in BoneHandle.GetSample(rig) do
 			sample[name] = value
 		end
 	end
